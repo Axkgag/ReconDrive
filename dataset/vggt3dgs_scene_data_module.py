@@ -196,6 +196,7 @@ class VGGT3DGS_SceneDataModule(pl.LightningDataModule):
             'with_pose': 'gt_pose' in self.train_requirements,
             'with_ego_pose': 'gt_ego_pose' in self.train_requirements,
             'with_mask': 'mask' in self.train_requirements,
+            'nuscenes_version': self.nuscenes_version,
         }
         
         dataset = NuScenesDataset(self.data_path, mode, **dataset_args)

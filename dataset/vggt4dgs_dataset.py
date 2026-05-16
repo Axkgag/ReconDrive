@@ -126,7 +126,7 @@ class NuScenesdataset4D(Dataset):
                     self.sample_tokens.extend(valid_start_frames)
                 else:
                     # Original mode (v1.0-trainval): no frame skipping, use consecutive frames
-                    scene_sample_tokens = scene_sample_tokens[self.bwd:len(scene_sample_tokens)-max(self.fwd, self.min_context_num)]
+                    scene_sample_tokens = scene_sample_tokens[self.bwd:len(scene_sample_tokens)-max(self.fwd, self.min_context_num, self.context_span)]
                     self.sample_tokens.extend(scene_sample_tokens)
                 if len(scene_sample_tokens) > 0:  # Only add scenes with valid samples
                     self.scenes_data.append(scene_sample_tokens)

@@ -145,3 +145,7 @@ ckpts/
 batchscript*
 phoenix*
 *.jpg.npz
+
+/checkpoints
+.claude
+.github

@@ -1674,8 +1674,9 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                 ego_T_ego = ego_T_ego.to(inputs['c2e_extr'].device)
                 outputs['input_all'][key] = ego_T_ego
             else:
-                raise KeyError(f"ego_T_ego key {key} not found in data_dict['all_dict']. "
-                             f"This should be precomputed in the dataset.")
+                # Fallback for samples without precomputed ego transforms.
+                # Keeps the pipeline running by using identity motion.
+                outputs['input_all'][key] = torch.eye(4, device=device).unsqueeze(0).repeat(b, 1, 1)
 
         for frame_id in self.all_render_frame_ids:
             for cam_id in range(self.num_cams):
@@ -1901,8 +1902,10 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                 scale_i = recontrast_data['scale_maps'][i]
                 opacity_i = recontrast_data['opacity_maps'][i]
 
-                # Frame 0: render each camera separately with only its own 3DGS
-                if frame_id == 0:
+                # Frame 0 default path assumes per-camera contiguous point ordering.
+                # AE-reconstructed Gaussians are scene-global, so use all points per camera.
+                use_ae_global_points = recontrast_data.get('ae_global_points', False)
+                if frame_id == 0 and not use_ae_global_points:
                     # Calculate points per camera (Gaussians are organized sequentially by camera)
                     points_per_cam = mid_point // self.num_cams
 

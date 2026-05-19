@@ -29,6 +29,11 @@ from utils.snapshot import save_pipeline_snapshot, PIPELINE_DEPLOYMENT
 
 torch.set_float32_matmul_precision('highest')
 
+# DataLoader workers ship batches to the main process via shared memory.
+# Default 'file_descriptor' strategy goes through /dev/shm which is small in K8s
+# pods; 'file_system' uses /tmp instead and avoids "No space left on device".
+torch.multiprocessing.set_sharing_strategy('file_system')
+
 
 def load_and_merge_configs(main_cfg_path):
     """Load and merge main config with sub-configs"""
@@ -188,7 +193,7 @@ def main():
         gradient_clip_val=1.0,
         callbacks=[checkpoint_callback, periodic_checkpoint_callback, LearningRateMonitor(), export_metric_callback],
         deterministic=True,
-        log_every_n_steps=100,
+        log_every_n_steps=10,
         enable_progress_bar=True,
         enable_model_summary=True,
         strategy='ddp_find_unused_parameters_true',

@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-from torch_scatter import scatter_max
+from torch_scatter import scatter_max, scatter_mean
 
 
 class Voxelizer:
@@ -131,10 +131,14 @@ class Voxelizer:
         cz = (vox_zi.float() + 0.5) * self.voxel_size + self.z_range[0]
         voxel_centers = torch.stack([cx, cy, cz], dim=-1)  # [M, 3]
 
-        # Replace absolute xyz with relative offset in feature vector
+        # Replace absolute xyz with pre-tanh offset in feature vector
+        # (inverse of tanh(x) * voxel_size/2, matching decoder output space)
         xyz_abs = voxel_features[:, self.IDX_XYZ]
         voxel_features = voxel_features.clone()
-        voxel_features[:, self.IDX_XYZ] = xyz_abs - voxel_centers
+        xyz_offset = xyz_abs - voxel_centers
+        voxel_features[:, self.IDX_XYZ] = torch.atanh(
+            (xyz_offset / (self.voxel_size / 2)).clamp(-0.999, 0.999)
+        )
 
         # Build spconv-style indices [M, 4] = (batch, z, y, x) as int32
         voxel_indices = torch.stack(
@@ -142,6 +146,118 @@ class Voxelizer:
         ).to(torch.int32)
 
         return voxel_features, voxel_indices, voxel_centers, B
+
+    def voxelize_with_all_gt(self, recontrast_data):
+        """
+        Like voxelize(), but also returns ALL GT Gaussians per voxel (not just
+        the max-opacity representative). Used for Chamfer loss computation.
+
+        Returns:
+            voxel_features  [M, 86]       — 1 representative Gaussian per voxel (for encoder)
+            voxel_indices   [M, 4]        — (batch, z, y, x) int32
+            voxel_centers   [M, 3]        — absolute XYZ of each voxel center
+            batch_size      int
+            all_gt_features [N_valid, 86] — ALL valid Gaussians (with xyz as offset)
+            all_gt_voxel_id [N_valid]     — which voxel (0..M-1) each GT belongs to
+        """
+        xyz     = recontrast_data['xyz']           # [B, N, 3]
+        rot     = recontrast_data['rot_maps']      # [B, N, 4]
+        scale   = recontrast_data['scale_maps']    # [B, N, 3]
+        opacity = recontrast_data['opacity_maps']  # [B, N, 1]
+        sh      = recontrast_data['sh_maps']       # [B, N, 25, 3] or [B, N, 3, 25]
+
+        B, N, _ = xyz.shape
+        device = xyz.device
+
+        # Normalise sh to [B, N, 75]
+        if sh.dim() == 4:
+            if sh.shape[-1] == 3:
+                sh_flat = sh.reshape(B, N, 75)
+            else:
+                sh_flat = sh.permute(0, 1, 3, 2).reshape(B, N, 75)
+        else:
+            sh_flat = sh.reshape(B, N, 75)
+
+        # Build 86-dim raw feature vector
+        raw_opacity = torch.logit(opacity.clamp(1e-6, 1 - 1e-6))
+        raw_scale   = self._inv_softplus(scale / 0.01)
+        feat = torch.cat([xyz, rot, raw_scale, raw_opacity, sh_flat], dim=-1)  # [B, N, 86]
+
+        # Flatten batch dimension
+        batch_ids = torch.arange(B, device=device).unsqueeze(1).expand(B, N).reshape(-1)
+        xyz_flat  = xyz.reshape(-1, 3)
+        feat_flat = feat.reshape(-1, 86)
+        opa_flat  = opacity.reshape(-1)
+
+        # Compute voxel indices
+        xi = ((xyz_flat[:, 0] - self.x_range[0]) / self.voxel_size).long()
+        yi = ((xyz_flat[:, 1] - self.y_range[0]) / self.voxel_size).long()
+        zi = ((xyz_flat[:, 2] - self.z_range[0]) / self.voxel_size).long()
+
+        valid = (xi >= 0) & (xi < self.nx) & \
+                (yi >= 0) & (yi < self.ny) & \
+                (zi >= 0) & (zi < self.nz)
+
+        xi, yi, zi = xi[valid], yi[valid], zi[valid]
+        batch_ids_v = batch_ids[valid]
+        feat_flat_v = feat_flat[valid]
+        opa_flat_v  = opa_flat[valid]
+
+        # Unique voxel key
+        stride_b = self.nz * self.ny * self.nx
+        voxel_key = batch_ids_v * stride_b + zi * (self.ny * self.nx) + yi * self.nx + xi
+
+        # Get unique voxels and map each point to a voxel index 0..M-1
+        unique_keys, inv_map = torch.unique(voxel_key, return_inverse=True)
+        M = unique_keys.shape[0]
+
+        # Sub-sample: keep the Gaussian with highest opacity per voxel (for encoder)
+        _, argmax_per_voxel = scatter_max(opa_flat_v, inv_map, dim=0)
+        point_indices = argmax_per_voxel  # [M]
+
+        voxel_features = feat_flat_v[point_indices]   # [M, 86]
+        vox_xi = xi[point_indices]
+        vox_yi = yi[point_indices]
+        vox_zi = zi[point_indices]
+        vox_b  = batch_ids_v[point_indices]
+
+        # Compute voxel centers
+        cx = (vox_xi.float() + 0.5) * self.voxel_size + self.x_range[0]
+        cy = (vox_yi.float() + 0.5) * self.voxel_size + self.y_range[0]
+        cz = (vox_zi.float() + 0.5) * self.voxel_size + self.z_range[0]
+        voxel_centers = torch.stack([cx, cy, cz], dim=-1)  # [M, 3]
+
+        # Replace absolute xyz with pre-tanh offset for the representative
+        voxel_features = voxel_features.clone()
+        xyz_offset = voxel_features[:, self.IDX_XYZ] - voxel_centers
+        voxel_features[:, self.IDX_XYZ] = torch.atanh(
+            (xyz_offset / (self.voxel_size / 2)).clamp(-0.999, 0.999)
+        )
+
+        # Build voxel indices
+        voxel_indices = torch.stack(
+            [vox_b, vox_zi, vox_yi, vox_xi], dim=-1
+        ).to(torch.int32)
+
+        # --- ALL GT features with xyz/rot converted to pre-activation space ---
+        # Compute voxel center for each GT point (using its voxel assignment)
+        all_gt_centers = voxel_centers[inv_map]  # [N_valid, 3]
+        all_gt_features = feat_flat_v.clone()
+
+        # xyz: actual offset → pre-tanh space (inverse of tanh(x) * voxel_size/2)
+        xyz_offset = all_gt_features[:, self.IDX_XYZ] - all_gt_centers
+        all_gt_features[:, self.IDX_XYZ] = torch.atanh(
+            (xyz_offset / (self.voxel_size / 2)).clamp(-0.999, 0.999)
+        )
+
+        # rot: normalized quaternion → raw (no transform needed, but ensure
+        # consistent scale by keeping as-is; the decoder output before
+        # F.normalize will learn to produce near-unit vectors)
+
+        all_gt_voxel_id = inv_map  # [N_valid], values in 0..M-1
+
+        return (voxel_features, voxel_indices, voxel_centers, B,
+                all_gt_features, all_gt_voxel_id)
 
     def devoxelize(self, decoded_features, voxel_indices, voxel_centers, batch_size):
         """

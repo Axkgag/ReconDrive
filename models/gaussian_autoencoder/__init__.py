@@ -2,7 +2,7 @@ from .autoencoder import GaussianAutoencoder
 from .voxelizer import Voxelizer
 from .encoding_head import EncodingHead, DecodingHead
 from .sparse_cnn import SparseEncoder, SparseDecoder
-from .losses import GaussianAELoss
+from .losses import GaussianAELoss, GaussianChamferLoss
 
 __all__ = [
     'GaussianAutoencoder',
@@ -12,4 +12,5 @@ __all__ = [
     'SparseEncoder',
     'SparseDecoder',
     'GaussianAELoss',
+    'GaussianChamferLoss',
 ]

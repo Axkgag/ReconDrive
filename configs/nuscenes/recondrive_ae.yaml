@@ -33,6 +33,7 @@ model_cfg:
   save_val_visualizations: true
   val_vis_interval: 200
   val_vis_max_per_epoch: 4
+  train_vis_interval: 500
 
   lambda_project: 1.0
   lambda_edge: 0.1
@@ -57,14 +58,15 @@ model_cfg:
     y_range: [-40, 40]
     z_range: [-1, 5.4]
     encoder_channels: [32, 64, 128, 256]
-    K: 8                    # Gaussians per voxel output by decoder
+    K: 4                    # Gaussians per voxel output by decoder
 
-    # Attribute reconstruction loss weights
+    # Attribute reconstruction loss weights (Chamfer matching)
     lambda_xyz:     1.0
     lambda_rot:     0.5
     lambda_scale:   0.5
     lambda_opacity: 0.5
     lambda_sh:      0.1
+    chamfer_alpha:  0.5         # 0.5=symmetric, 1.0=pred→gt only, 0.0=gt→pred only
 
     # Rendering loss weight (multiplied onto compute_gaussian_loss output)
     lambda_render:  1.0
@@ -84,8 +86,8 @@ data_cfg:
   train_requirements: (gt_pose, gt_ego_pose, gt_depth, mask)
   val_requirements: (gt_pose, gt_ego_pose, gt_depth, mask)
 
-  batch_size: 2
+  batch_size: 6  # Reduced to 2 to avoid GPU OOM
   data_shuffle: True
   drop_last: False
-  num_workers: 4
+  num_workers: 1  # Set to 0 to avoid shared memory issues with 8 GPUs
   num_epochs: 10

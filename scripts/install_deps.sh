@@ -19,6 +19,18 @@ pip install yacs ${PIP_MIRROR}
 echo "=== Installing lpips (perceptual loss) ==="
 pip install lpips ${PIP_MIRROR}
 
+echo "=== Installing rich ==="
+pip install rich ${PIP_MIRROR}
+
+echo "=== Installing jaxtyping ==="
+pip install jaxtyping ${PIP_MIRROR}
+
+echo "=== Installing nuscenes-devkit ==="
+pip install nuscenes-devkit ${PIP_MIRROR}
+
+echo "=== Installing gsplat ==="
+pip install gsplat ${PIP_MIRROR}
+
 echo "=== Installing kornia (CV ops, SSIMLoss) ==="
 pip install kornia ${PIP_MIRROR}
 
@@ -29,10 +41,16 @@ echo "=== Installing torch-scatter (built from source, ~5-10 min) ==="
 pip install torch-scatter ${PIP_MIRROR}
 
 echo "=== Installing pytorch3d (built from source, ~10-30 min) ==="
-pip install "git+https://github.com/facebookresearch/pytorch3d.git" ${PIP_MIRROR}
+pip install "git+https://gitcode.com/gh_mirrors/py/pytorch3d.git" ${PIP_MIRROR}
+
+echo ">>>安装 diff-gaussian-rasterization modified"
+pip install "git+https://gh-proxy.com/https://github.com/dcharatan/diff-gaussian-rasterization-modified"
 
 echo "=== Running OccWM setup_env.sh ==="
-bash /data_map/liangyihao/OccWM/setup_env.sh
+cd /data_map/liangyihao/OccWM && bash setup_env.sh
+
+mkdir -p /root/.cache/torch/hub/checkpoints
+ln -sf /data_map/liangyihao/ReconDrive/checkpoints/vgg16-397923af.pth /root/.cache/torch/hub/checkpoints/vgg16-397923af.pth
 
 echo ""
 echo "=== All dependencies installed successfully ==="

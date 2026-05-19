@@ -39,6 +39,25 @@ if [[ "$WILL_RESUME" == false ]]; then
     EXTRA_ARGS="$EXTRA_ARGS --pretrained_ckpt=${PRETRAINED_CHECKPOINT_PATH}"
 fi
 
+# Warmup gsplat CUDA JIT cache with a single process before launching DDP.
+# Without this, all ranks try to compile into /tmp/torch_extensions/gsplat_cuda
+# concurrently and corrupt each other's build dirs (getcwd() failed errors).
+echo "=== Warming up gsplat CUDA JIT cache (single process) ==="
+CUDA_VISIBLE_DEVICES=$(echo "${CUDA_VISIBLE_DEVICES:-0}" | cut -d, -f1) python -c "
+import torch
+from gsplat import rasterization
+N = 100
+means = torch.randn(N, 3, device='cuda')
+quats = torch.randn(N, 4, device='cuda')
+scales = torch.rand(N, 3, device='cuda') * 0.1
+opacities = torch.rand(N, device='cuda')
+colors = torch.rand(N, 3, device='cuda')
+viewmats = torch.eye(4, device='cuda')[None]
+Ks = torch.tensor([[[300.,0,128],[0,300,128],[0,0,1]]], device='cuda')
+rasterization(means, quats, scales, opacities, colors, viewmats, Ks, 256, 256)
+print('gsplat JIT cache ready')
+" || { echo 'gsplat warmup failed'; exit 1; }
+
 python -m scripts.trainer \
     --cfg_path=${CONFIG_PATH} \
     --train_4d \

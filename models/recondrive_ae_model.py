@@ -45,6 +45,9 @@ class ReconDriveAE_LITModelModule(ReconDrive_LITModelModule):
         self.val_vis_max_per_epoch = int(cfg.get('val_vis_max_per_epoch', 4))
         self._val_vis_saved_this_epoch = 0
 
+        # Training visualization settings
+        self.train_vis_interval = int(cfg.get('train_vis_interval', 500))
+
         # Freeze backbone (ReconDrive stage1 model) by default
         self.freeze_backbone = ae_cfg.get('freeze_backbone', True)
         if self.freeze_backbone:
@@ -115,13 +118,13 @@ class ReconDriveAE_LITModelModule(ReconDrive_LITModelModule):
     def save_validation_step_images(self, batch_idx, splating_stage1, splating_ae,
                                     recon_stage1, recon_ae):
         """
-        Save a single composite figure per validation step:
+        Save a single composite figure per step:
 
           Rows:    one per camera
           Columns: GT image | Stage1 render | AE render | Stage1 3D Gauss | AE 3D Gauss
 
         Args:
-            batch_idx: validation batch index
+            batch_idx: batch index
             splating_stage1: render dict using original (Stage1) Gaussians
             splating_ae:     render dict using AE-reconstructed Gaussians
             recon_stage1: original recontrast_data dict (xyz, opacity_maps, sh_maps)
@@ -131,8 +134,9 @@ class ReconDriveAE_LITModelModule(ReconDrive_LITModelModule):
 
         @rank_zero_only
         def _save():
+            vis_subdir = 'train_visualizations' if self.stage == 'train' else 'val_visualizations'
             save_dir = os.path.join(
-                self.save_dir, 'val_visualizations', f'epoch_{self.current_epoch:04d}'
+                self.save_dir, vis_subdir, f'epoch_{self.current_epoch:04d}'
             )
             os.makedirs(save_dir, exist_ok=True)
 
@@ -319,12 +323,18 @@ class ReconDriveAE_LITModelModule(ReconDrive_LITModelModule):
         # 1. Get original Gaussians from frozen VGGT backbone
         batch_recontrast_data = self.get_recontrast_data(batch_input, batch_idx)
 
-        # 2. AE encode → decode
-        batch_recontrast_recon, _, gt_target = self.gaussian_ae.forward_with_targets(batch_recontrast_data)
+        # 2. AE encode → decode (with Chamfer targets)
+        batch_recontrast_recon, _, chamfer_targets = self.gaussian_ae.forward_with_targets(batch_recontrast_data)
         batch_recontrast_recon = self._attach_render_fields(batch_recontrast_recon)
 
-        # 3. Attribute reconstruction loss
-        loss_dict = self.gaussian_ae.loss_fn(batch_recontrast_recon, gt_target)
+        # 3. Chamfer-based attribute reconstruction loss
+        loss_dict = self.gaussian_ae.loss_fn(
+            chamfer_targets['pred_raw'],
+            chamfer_targets['all_gt_features'],
+            chamfer_targets['all_gt_voxel_id'],
+            chamfer_targets['M'],
+            chamfer_targets['K'],
+        )
         loss_attr = loss_dict['total']
 
         # 4. Render reconstructed Gaussians and compute photometric loss
@@ -341,21 +351,44 @@ class ReconDriveAE_LITModelModule(ReconDrive_LITModelModule):
         loss_all = loss_attr + self.lambda_render * loss_render + loss_project + loss_norm
 
         # Logging
+        self.log(f'{stage}/loss_total', loss_all.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log(f'{stage}/ae_attr',    loss_attr.item(),   on_step=True, on_epoch=True, prog_bar=True,  sync_dist=True)
         self.log(f'{stage}/ae_render',  loss_render.item(), on_step=True, on_epoch=True, prog_bar=True,  sync_dist=True)
-        self.log(f'{stage}/ae_xyz',     loss_dict['xyz'].item(),     on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
-        self.log(f'{stage}/ae_rot',     loss_dict['rot'].item(),     on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
-        self.log(f'{stage}/ae_scale',   loss_dict['scale'].item(),   on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
-        self.log(f'{stage}/ae_opacity', loss_dict['opacity'].item(), on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
-        self.log(f'{stage}/ae_sh',      loss_dict['sh'].item(),      on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+        self.log(f'{stage}/ae_xyz',     loss_dict['xyz'].item(),     on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log(f'{stage}/ae_rot',     loss_dict['rot'].item(),     on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log(f'{stage}/ae_scale',   loss_dict['scale'].item(),   on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log(f'{stage}/ae_opacity', loss_dict['opacity'].item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log(f'{stage}/ae_sh',      loss_dict['sh'].item(),      on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log(f'{stage}/proj',       loss_project.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log(f'{stage}/norm',       loss_norm.item(),    on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
 
+        # Learning rate
+        opt = self.optimizers()
+        current_lr = opt.param_groups[0]['lr']
+        self.log(f'{stage}/lr', current_lr, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+
         psnr, ssim, lpips = self.compute_reconstruction_metrics(batch_splating_data, stage)
+
+        # Training visualization
+        if self.global_step % self.train_vis_interval == 0:
+            with torch.no_grad():
+                stage1_recon_frame0 = self._extract_frame0_gaussians(batch_recontrast_data)
+                stage1_recon_frame0['ae_global_points'] = True
+                batch_splating_stage1 = self.render_splating_imgs(
+                    stage1_recon_frame0, batch_render_data
+                )
+            self.save_validation_step_images(
+                batch_idx,
+                splating_stage1=batch_splating_stage1,
+                splating_ae=batch_splating_data,
+                recon_stage1=stage1_recon_frame0,
+                recon_ae=batch_recontrast_recon,
+            )
+            del batch_splating_stage1, stage1_recon_frame0
 
         del batch_input, batch_recontrast_data, batch_recontrast_recon
         del batch_render_data, batch_render_project_data, batch_splating_data
-        del psnr, ssim, lpips
+        del psnr, ssim, lpips, chamfer_targets
 
         return loss_all
 
@@ -370,10 +403,16 @@ class ReconDriveAE_LITModelModule(ReconDrive_LITModelModule):
         self.init_novel_view_mode()
 
         batch_recontrast_data = self.get_recontrast_data(batch_input)
-        batch_recontrast_recon, _, gt_target = self.gaussian_ae.forward_with_targets(batch_recontrast_data)
+        batch_recontrast_recon, _, chamfer_targets = self.gaussian_ae.forward_with_targets(batch_recontrast_data)
         batch_recontrast_recon = self._attach_render_fields(batch_recontrast_recon)
 
-        loss_dict   = self.gaussian_ae.loss_fn(batch_recontrast_recon, gt_target)
+        loss_dict = self.gaussian_ae.loss_fn(
+            chamfer_targets['pred_raw'],
+            chamfer_targets['all_gt_features'],
+            chamfer_targets['all_gt_voxel_id'],
+            chamfer_targets['M'],
+            chamfer_targets['K'],
+        )
         loss_attr   = loss_dict['total']
 
         batch_render_data    = self.get_render_data(batch_input)
@@ -387,8 +426,14 @@ class ReconDriveAE_LITModelModule(ReconDrive_LITModelModule):
 
         loss_all = loss_attr + self.lambda_render * loss_render + loss_depth + loss_project + loss_norm
 
+        self.log(f'{stage}/loss_total', loss_all.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log(f'{stage}/ae_attr',   loss_attr.item(),   on_step=True, on_epoch=True, prog_bar=True,  sync_dist=True)
         self.log(f'{stage}/ae_render', loss_render.item(), on_step=True, on_epoch=True, prog_bar=True,  sync_dist=True)
+        self.log(f'{stage}/ae_xyz',    loss_dict['xyz'].item(),     on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log(f'{stage}/ae_rot',    loss_dict['rot'].item(),     on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log(f'{stage}/ae_scale',  loss_dict['scale'].item(),   on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log(f'{stage}/ae_opacity',loss_dict['opacity'].item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log(f'{stage}/ae_sh',     loss_dict['sh'].item(),      on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log(f'{stage}/depth',     loss_depth.item(),  on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log(f'{stage}/proj',      loss_project.item(),on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log(f'{stage}/norm',      loss_norm.item(),   on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)

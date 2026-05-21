@@ -114,13 +114,23 @@ def main():
             print(f"     ✓ opacity: {batch_recontrast_data['opacity_maps'].shape}")
 
             print("   → gaussian_ae.forward()...")
-            batch_recontrast_recon, latent, gt_target = model.gaussian_ae.forward_with_targets(batch_recontrast_data)
+            batch_recontrast_recon, latent, chamfer_targets = model.gaussian_ae.forward_with_targets(batch_recontrast_data)
             batch_recontrast_recon = model._attach_render_fields(batch_recontrast_recon)
             print(f"     ✓ latent features: {latent.F.shape}")
             print(f"     ✓ recon xyz: {batch_recontrast_recon['xyz'].shape}")
 
             print("   → gaussian_ae.loss_fn()...")
-            loss_dict = model.gaussian_ae.loss_fn(batch_recontrast_recon, gt_target)
+            if chamfer_targets['all_gt_features'].numel() == 0 or chamfer_targets['M'] == 0:
+                zero = torch.tensor(0.0, device=batch_recontrast_recon['xyz'].device)
+                loss_dict = {k: zero for k in ['total', 'xyz', 'rot', 'scale', 'opacity', 'sh']}
+            else:
+                loss_dict = model.gaussian_ae.loss_fn(
+                    chamfer_targets['pred_raw'],
+                    chamfer_targets['all_gt_features'],
+                    chamfer_targets['all_gt_voxel_id'],
+                    chamfer_targets['M'],
+                    chamfer_targets['K'],
+                )
             print(f"     ✓ loss_attr: {loss_dict['total'].item():.6f}")
             print(f"       - xyz:     {loss_dict['xyz'].item():.6f}")
             print(f"       - rot:     {loss_dict['rot'].item():.6f}")

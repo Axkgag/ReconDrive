@@ -50,6 +50,7 @@ def main():
     parser.add_argument('--train_4d', action='store_true', help='4dgs')
     parser.add_argument('--devices', type=int, default=None, help='Number of GPUs to use (overrides config)')
     parser.add_argument('--use_ae', action='store_true', help='Use ReconDriveAE_LITModelModule')
+    parser.add_argument('--use_stage1', action='store_true', help='Use ReconDriveStage1_LITModelModule')
     parser.add_argument('--work_dir', type=str, default=None, help='Working directory for checkpoints and logs')
     parser.add_argument('--tensorboard_dir', type=str, default=None, help='TensorBoard log directory')
     parser.add_argument('--resume', action='store_true', help='Auto-resume from latest checkpoint in work_dir')
@@ -105,8 +106,12 @@ def main():
             cfg=main_cfg['data_cfg'],
         )
 
+    use_stage1 = args.use_stage1 or main_cfg['model_cfg'].get('use_stage1', False)
     use_ae = args.use_ae or main_cfg['model_cfg'].get('use_gaussian_ae', False)
-    if use_ae:
+    if use_stage1:
+        from models.recondrive_stage1_model import ReconDriveStage1_LITModelModule
+        model_cls = ReconDriveStage1_LITModelModule
+    elif use_ae:
         from models.recondrive_ae_model import ReconDriveAE_LITModelModule
         model_cls = ReconDriveAE_LITModelModule
     else:

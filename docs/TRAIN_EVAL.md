@@ -12,6 +12,13 @@ We provide all trained checkpoints here.
 ## Training
 ReconDrive training consists of two main stages. Pretrained and trained checkpoints for stage 2, are listed below.
 
+### Stage-one: Single-Frame 3D Gaussian Training
+
+In the first stage, we train the stage1 model for single-frame 3D Gaussian prediction.
+  ```
+  CUDA_VISIBLE_DEVICES=${GPU_IDs} bash scripts/train.sh ${GPU_NUM} configs/nuscenes/recondrive_stage1.yaml
+  ```
+
 ### Stage-two: ReconDrive Training with Two-Frame Inputs
 
 In the second stage, we train the final ReconDrive models.

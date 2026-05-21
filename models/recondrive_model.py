@@ -576,7 +576,7 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         self.save_dir = save_dir
         vggt_checkpoint = getattr(self, 'vggt_checkpoint', './checkpoints/vggt.pt')
         self.model = ReconDriveModel(sh_degree=self.sh_degree,min_depth=self.min_depth, max_depth=self.max_depth, vggt_checkpoint=vggt_checkpoint) 
-        self.lpips = LPIPS(net="vgg")
+        self.lpips = LPIPS(net="vgg", pretrained=False, model_path='/data_map/liangyihao/ReconDrive/checkpoints/lpips_vgg.pth')
         self.ssim_fn = SSIMLoss(window_size=11,reduction='none')
         self.l1_fn = torch.nn.L1Loss(reduction='none')
         self.lpips.eval()
@@ -1954,13 +1954,19 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                         )
 
                         render_rgb_cam = render_colors_cam[..., :3].permute(0, 3, 1, 2)  # [1, 3, H, W]
+                        if render_alphas_cam.dim() == 3:
+                            render_alphas_cam = render_alphas_cam.unsqueeze(-1)
+                        render_alpha_cam = render_alphas_cam.permute(0, 3, 1, 2)  # [1, 1, H, W]
 
                         if ('gaussian_color', frame_id, cam_id) not in outputs:
                             outputs[('gaussian_color', frame_id, cam_id)] = []
                         outputs[('gaussian_color', frame_id, cam_id)].append(render_rgb_cam[0])
+                        if ('gaussian_alpha', frame_id, cam_id) not in outputs:
+                            outputs[('gaussian_alpha', frame_id, cam_id)] = []
+                        outputs[('gaussian_alpha', frame_id, cam_id)].append(render_alpha_cam[0])
 
                         del xyz_cam, rot_cam, scale_cam, opacity_cam, sh_cam, e2c_extr_cam, K_cam
-                        del render_colors_cam, render_alphas_cam, meta_cam, render_rgb_cam
+                        del render_colors_cam, render_alphas_cam, meta_cam, render_rgb_cam, render_alpha_cam
 
                 else:
                     # Other frames: render all cameras together with all Gaussians
@@ -2005,16 +2011,27 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                     )
                     # render_rgb_i, render_depth_i = render_colors_i[...,:3], render_colors_i[...,3]
                     render_rgb_i = render_colors_i[...,:3].permute(0,3,1,2)
+                    if render_alphas_i.dim() == 3:
+                        render_alphas_i = render_alphas_i.unsqueeze(-1)
+                    render_alpha_i = render_alphas_i.permute(0, 3, 1, 2)  # [num_cams, 1, H, W]
                     del xyz_i, rot_i, scale_i, opacity_i, sh_i, e2c_extr_i, K_i, render_colors_i, render_alphas_i, meta_i
 
                     for cam_id in range(self.num_cams):
                         if ('gaussian_color', frame_id, cam_id) not in outputs:
                             outputs[('gaussian_color', frame_id, cam_id)] = []
                         outputs[('gaussian_color', frame_id, cam_id)].append(render_rgb_i[cam_id])
+                        if ('gaussian_alpha', frame_id, cam_id) not in outputs:
+                            outputs[('gaussian_alpha', frame_id, cam_id)] = []
+                        outputs[('gaussian_alpha', frame_id, cam_id)].append(render_alpha_i[cam_id])
 
             for cam_id in range(self.num_cams):
                 gaussian_color = torch.stack(outputs[('gaussian_color', frame_id,cam_id)],dim=0).contiguous()
                 outputs[('groudtruth', frame_id, cam_id)] = render_data[('groudtruth', frame_id, cam_id)]
+                if ('gaussian_alpha', frame_id, cam_id) in outputs:
+                    gaussian_alpha = torch.stack(
+                        outputs[('gaussian_alpha', frame_id, cam_id)], dim=0
+                    ).contiguous()
+                    outputs[('gaussian_alpha', frame_id, cam_id)] = gaussian_alpha
 
                 if self.render_cam_mode=='shift':
                     ref_mask = render_data[('gt_mask',frame_id,cam_id)]

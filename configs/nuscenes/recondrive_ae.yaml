@@ -33,7 +33,7 @@ model_cfg:
   save_val_visualizations: true
   val_vis_interval: 200
   val_vis_max_per_epoch: 4
-  train_vis_interval: 500
+  train_vis_interval: 50
 
   lambda_project: 1.0
   lambda_edge: 0.1
@@ -70,6 +70,9 @@ model_cfg:
 
     # Rendering loss weight (multiplied onto compute_gaussian_loss output)
     lambda_render:  1.0
+    # Range-visibility mask for AE render loss
+    use_range_render_mask: true
+    range_mask_alpha_thresh: 0.01
 
 
 data_cfg:

@@ -38,6 +38,8 @@ class ReconDriveAE_LITModelModule(ReconDrive_LITModelModule):
         ae_cfg = cfg.get('ae_cfg', {})
         self.gaussian_ae = GaussianAutoencoder(ae_cfg)
         self.lambda_render = ae_cfg.get('lambda_render', 1.0)
+        self.ae_use_range_mask = ae_cfg.get('use_range_render_mask', True)
+        self.ae_mask_alpha_thresh = ae_cfg.get('range_mask_alpha_thresh', 0.01)
 
         # Validation visualization settings
         self.save_val_visualizations = cfg.get('save_val_visualizations', False)
@@ -47,6 +49,7 @@ class ReconDriveAE_LITModelModule(ReconDrive_LITModelModule):
 
         # Training visualization settings
         self.train_vis_interval = int(cfg.get('train_vis_interval', 500))
+        self.vis_step = 0
 
         # Freeze backbone (ReconDrive stage1 model) by default
         self.freeze_backbone = ae_cfg.get('freeze_backbone', True)
@@ -192,7 +195,7 @@ class ReconDriveAE_LITModelModule(ReconDrive_LITModelModule):
             plt.tight_layout()
             out_path = os.path.join(
                 save_dir,
-                f'val_step_{self.global_step:08d}_batch_{batch_idx:05d}.png'
+                f'step_{self.vis_step:08d}_batch_{batch_idx:05d}.png'
             )
             fig.savefig(out_path, bbox_inches='tight')
             plt.close(fig)
@@ -285,6 +288,59 @@ class ReconDriveAE_LITModelModule(ReconDrive_LITModelModule):
         batch_recontrast_recon['ae_global_points'] = True
         return batch_recontrast_recon
 
+    def _apply_voxel_range_opacity(self, batch_recontrast_data):
+        """
+        Zero out opacity for Gaussians outside the AE voxel range (keep shape).
+        """
+        voxelizer = self.gaussian_ae.voxelizer
+        xyz = batch_recontrast_data['xyz']
+        x0, x1 = voxelizer.x_range
+        y0, y1 = voxelizer.y_range
+        z0, z1 = voxelizer.z_range
+
+        valid = (
+            (xyz[..., 0] >= x0) & (xyz[..., 0] < x1) &
+            (xyz[..., 1] >= y0) & (xyz[..., 1] < y1) &
+            (xyz[..., 2] >= z0) & (xyz[..., 2] < z1)
+        )
+
+        out = {}
+        for key, val in batch_recontrast_data.items():
+            if torch.is_tensor(val) and val.dim() >= 2 and val.shape[:2] == xyz.shape[:2]:
+                if key == 'opacity_maps':
+                    out[key] = val * valid.unsqueeze(-1)
+                else:
+                    out[key] = val
+            else:
+                out[key] = val
+
+        # Render as scene-global points (same as AE reconstruction).
+        out['ae_global_points'] = True
+        return out
+
+    def _apply_range_visibility_mask(self, batch_splating_data, batch_recontrast_data, batch_render_data):
+        """
+        Build a visibility mask from voxel-range filtered Stage-1 Gaussians and
+        apply it to the gaussian loss mask.
+        """
+        if not self.ae_use_range_mask:
+            return batch_splating_data
+
+        stage1_range = self._apply_voxel_range_opacity(batch_recontrast_data)
+        range_splating = self.render_splating_imgs(stage1_range, batch_render_data)
+
+        for frame_id in self.all_render_frame_ids:
+            for cam_id in range(self.num_cams):
+                alpha = range_splating.get(('gaussian_alpha', frame_id, cam_id))
+                if alpha is None:
+                    continue
+                range_mask = (alpha > self.ae_mask_alpha_thresh).to(alpha.dtype)
+                batch_splating_data[('warped_mask', frame_id, cam_id)] = (
+                    batch_splating_data[('warped_mask', frame_id, cam_id)] * range_mask
+                ).detach()
+
+        return batch_splating_data
+
     @staticmethod
     def _extract_frame0_gaussians(batch_recontrast_data):
         """
@@ -340,6 +396,9 @@ class ReconDriveAE_LITModelModule(ReconDrive_LITModelModule):
         # 4. Render reconstructed Gaussians and compute photometric loss
         batch_render_data   = self.get_render_data(batch_input)
         batch_splating_data = self.render_splating_imgs(batch_recontrast_recon, batch_render_data)
+        batch_splating_data = self._apply_range_visibility_mask(
+            batch_splating_data, batch_recontrast_data, batch_render_data
+        )
         loss_render = self.compute_gaussian_loss(batch_splating_data)
 
         # 5. Projection loss (unchanged from parent)
@@ -370,25 +429,46 @@ class ReconDriveAE_LITModelModule(ReconDrive_LITModelModule):
         psnr, ssim, lpips = self.compute_reconstruction_metrics(batch_splating_data, stage)
 
         # Training visualization
-        if self.global_step % self.train_vis_interval == 0:
+        is_global_zero = True
+        if hasattr(self, "trainer") and self.trainer is not None:
+            is_global_zero = self.trainer.is_global_zero
+        should_visualize = (
+            is_global_zero and
+            self.train_vis_interval > 0 and
+            self.vis_step % self.train_vis_interval == 0
+        )
+        if should_visualize:
             with torch.no_grad():
-                stage1_recon_frame0 = self._extract_frame0_gaussians(batch_recontrast_data)
-                stage1_recon_frame0['ae_global_points'] = True
-                batch_splating_stage1 = self.render_splating_imgs(
-                    stage1_recon_frame0, batch_render_data
-                )
+                render_ids_backup = self.all_render_frame_ids
+                try:
+                    # Ensure frame-0 render data exists even when training samples frames.
+                    self.all_render_frame_ids = [0]
+                    vis_render_data = self.get_render_data(batch_input)
+
+                    stage1_recon_frame0 = self._extract_frame0_gaussians(batch_recontrast_data)
+                    stage1_recon_frame0['ae_global_points'] = True
+                    batch_splating_stage1 = self.render_splating_imgs(
+                        stage1_recon_frame0, vis_render_data
+                    )
+                    batch_splating_ae_vis = self.render_splating_imgs(
+                        batch_recontrast_recon, vis_render_data
+                    )
+                finally:
+                    self.all_render_frame_ids = render_ids_backup
             self.save_validation_step_images(
                 batch_idx,
                 splating_stage1=batch_splating_stage1,
-                splating_ae=batch_splating_data,
+                splating_ae=batch_splating_ae_vis,
                 recon_stage1=stage1_recon_frame0,
                 recon_ae=batch_recontrast_recon,
             )
-            del batch_splating_stage1, stage1_recon_frame0
+            del batch_splating_stage1, batch_splating_ae_vis, stage1_recon_frame0
 
         del batch_input, batch_recontrast_data, batch_recontrast_recon
         del batch_render_data, batch_render_project_data, batch_splating_data
         del psnr, ssim, lpips, chamfer_targets
+
+        self.vis_step += 1
 
         return loss_all
 
@@ -417,6 +497,9 @@ class ReconDriveAE_LITModelModule(ReconDrive_LITModelModule):
 
         batch_render_data    = self.get_render_data(batch_input)
         batch_splating_ae    = self.render_splating_imgs(batch_recontrast_recon, batch_render_data)
+        batch_splating_ae = self._apply_range_visibility_mask(
+            batch_splating_ae, batch_recontrast_data, batch_render_data
+        )
         loss_render  = self.compute_gaussian_loss(batch_splating_ae)
         loss_depth   = self.compute_depth_loss(batch_splating_ae)
 

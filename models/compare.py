@@ -1014,38 +1014,38 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             ego_T_ego_0toN_initial = inputs[ego_T_ego_key]
 
             # Enable ICP refinement (can be controlled by config)
-                # Extract frame 0 and frame N points for ICP
-                mid_point = outputs['xyz'].shape[1] // 2
-                xyz_frame0_all = outputs['xyz'][:, :mid_point, :]
-                xyz_frameN_all = outputs['xyz'][:, mid_point:, :]
+            # Extract frame 0 and frame N points for ICP
+            mid_point = outputs['xyz'].shape[1] // 2
+            xyz_frame0_all = outputs['xyz'][:, :mid_point, :]
+            xyz_frameN_all = outputs['xyz'][:, mid_point:, :]
 
-                points_per_camera = xyz_frame0_all.shape[1] // self.num_cams
-                subsample_rate = getattr(self, 'icp_subsample_rate', 10)
+            points_per_camera = xyz_frame0_all.shape[1] // self.num_cams
+            subsample_rate = getattr(self, 'icp_subsample_rate', 10)
 
-                # Refine transformation for each camera
-                refined_ego_T_ego_list = []
+            # Refine transformation for each camera
+            refined_ego_T_ego_list = []
 
-                for cam_id in range(self.num_cams):
-                    # Extract this camera's points
-                    cam_start = cam_id * points_per_camera
-                    cam_end = (cam_id + 1) * points_per_camera
-                    xyz_frame0_cam = xyz_frame0_all[:, cam_start:cam_end, :]
-                    xyz_frameN_cam = xyz_frameN_all[:, cam_start:cam_end, :]
+            for cam_id in range(self.num_cams):
+                # Extract this camera's points
+                cam_start = cam_id * points_per_camera
+                cam_end = (cam_id + 1) * points_per_camera
+                xyz_frame0_cam = xyz_frame0_all[:, cam_start:cam_end, :]
+                xyz_frameN_cam = xyz_frameN_all[:, cam_start:cam_end, :]
 
-                    # Extract second half (bottom half of image) for ICP
-                    # Points are in row-major order: [batch, H*W, 3]
-                    # Second half starts at H*W//2
-                    half_point = points_per_camera // 2
-                    xyz_frame0_cam = xyz_frame0_cam[:, half_point:, :]
-                    xyz_frameN_cam = xyz_frameN_cam[:, half_point:, :]
+                # Extract second half (bottom half of image) for ICP
+                # Points are in row-major order: [batch, H*W, 3]
+                # Second half starts at H*W//2
+                half_point = points_per_camera // 2
+                xyz_frame0_cam = xyz_frame0_cam[:, half_point:, :]
+                xyz_frameN_cam = xyz_frameN_cam[:, half_point:, :]
 
-                    # Subsample points for efficiency
-                    xyz_frame0_sub = xyz_frame0_cam[:, ::subsample_rate, :]
-                    xyz_frameN_sub = xyz_frameN_cam[:, ::subsample_rate, :]
+                # Subsample points for efficiency
+                xyz_frame0_sub = xyz_frame0_cam[:, ::subsample_rate, :]
+                xyz_frameN_sub = xyz_frameN_cam[:, ::subsample_rate, :]
 
-                    # Get camera-specific transformation
-                    if ego_T_ego_0toN_initial.dim() == 4:
-                        # [batch_size, num_cameras, 4, 4] - Use camera-specific transformation
+                # Get camera-specific transformation
+                if ego_T_ego_0toN_initial.dim() == 4:
+                    # [batch_size, num_cameras, 4, 4] - Use camera-specific transformation
                         ego_T_ego_0toN_cam = ego_T_ego_0toN_initial[:, cam_id]
                     else:
                         # [batch_size, 4, 4] - Use unified transformation for all cameras

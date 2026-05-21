@@ -5,6 +5,7 @@ from functools import partial
 
 from dataset.data_util import train_transforms
 from dataset.vggt4dgs_dataset import NuScenesdataset4D, custom_collate_fn
+from dataset.vggt3dgs_dataset import NuScenesdataset3D
 from dataset.vggt4dgs_scene_dataset_wrapper import SceneBasedDataset, SceneBatchDataLoader
 
 
@@ -147,16 +148,29 @@ class VGGT4DGS_LITDataModule(pl.LightningDataModule):
             'val': 'val',
             'test': 'val'
         }
+        dataset_type = getattr(self, 'dataset_type', '4d')
         if mode=='train':
-            dataset = NuScenesdataset4D(
-                self.data_path, 'train',
-                **dataset_args            
-            )
+            if dataset_type == '3d':
+                dataset = NuScenesdataset3D(
+                    self.data_path, 'train',
+                    **dataset_args
+                )
+            else:
+                dataset = NuScenesdataset4D(
+                    self.data_path, 'train',
+                    **dataset_args            
+                )
         elif (mode=='val') or (mode=='test'):
-            dataset = NuScenesdataset4D(
-                self.data_path, 'val',
-                **dataset_args            
-            )
+            if dataset_type == '3d':
+                dataset = NuScenesdataset3D(
+                    self.data_path, 'val',
+                    **dataset_args
+                )
+            else:
+                dataset = NuScenesdataset4D(
+                    self.data_path, 'val',
+                    **dataset_args            
+                )
         else:
             raise ValueError('Unknown mode: ' + mode)
 

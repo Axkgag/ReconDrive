@@ -1,0 +1,69 @@
+save_dir: './work_dirs/recondrive_stage1_training'
+seed: 1
+train_epoch: 2
+devices: [0,1,2,3,4,5,6,7]
+
+model_cfg:
+  use_stage1: true
+  height: 280
+  width: 518
+  render_width_min: 259
+  render_width_max: 768
+  num_cams: 6
+  embed_dim: 1024
+  auto_scale_lr: True
+  learning_rate: 0.00001
+  weight_decay: 0.01
+  lr_restart_epoch: 5
+  lr_restart_mult: 2
+  lr_min_factor: 0.01
+
+  # Single-frame prediction (frame 0 only)
+  frame_ids: [0]
+  context_span: 0
+  use_vehicle_flow: false
+
+  depth_conf_thr: 0.99
+  min_depth: 1.5
+  max_depth: 110
+  focal_length_scale: 300
+  sh_degree: 4
+
+  save_image_duration: 100
+  save_val_visualizations: true
+  val_vis_interval: 200
+  val_vis_max_per_epoch: 4
+
+  # Loss weights (Gaussian + Norm)
+  lambda_gaussian: 2
+  lambda_scale: 0.01
+  lambda_opacity: 0.01
+  lambda_edge: 0.1
+  lambda_depth: 0.001
+
+  # Model checkpoint paths
+  vggt_checkpoint: 'checkpoints/vggt.pt'
+  sam2_checkpoint: 'checkpoints/sam2.1_hiera_small.pt'
+  sam2_model_cfg: 'configs/sam2.1/sam2.1_hiera_s.yaml'
+  sam2_dir: null
+
+data_cfg:
+  dataset_type: '3d'
+  data_path: './data/nuscenes/'
+  cache_dir: './work_dirs/cache_data/nuscenes-12HZ'
+  height: 280
+  width: 518
+  back_context: 0
+  forward_context: 0
+  depth_type: 'lidar'
+  nuscenes_version: 'v1.0-trainval'
+  context_span: 0
+  cameras: ['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT', 'CAM_BACK']
+  train_requirements: (gt_pose, gt_ego_pose, gt_depth, mask)
+  val_requirements: (gt_pose, gt_ego_pose, gt_depth, mask)
+
+  batch_size: 2
+  data_shuffle: True
+  drop_last: False
+  num_workers: 4
+  num_epochs: 10

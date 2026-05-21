@@ -8,10 +8,17 @@ WORK_DIR="${3:-}"
 TENSORBOARD_DIR="${4:-}"
 EXTRA_ARGS=""
 WILL_RESUME=false
+IS_STAGE1=false
 
 # Auto-detect AE mode
 if [[ "${USE_AE:-0}" == "1" ]] || [[ "$CONFIG_PATH" == *"recondrive_ae.yaml" ]]; then
     EXTRA_ARGS="--use_ae"
+fi
+
+# Auto-detect Stage1 mode
+if [[ "${USE_STAGE1:-0}" == "1" ]] || [[ "$CONFIG_PATH" == *"recondrive_stage1.yaml" ]]; then
+    EXTRA_ARGS="$EXTRA_ARGS --use_stage1"
+    IS_STAGE1=true
 fi
 
 # Add work_dir if specified
@@ -33,9 +40,9 @@ if [[ -n "$WORK_DIR" ]] && [[ -d "$WORK_DIR/ckpt" ]]; then
     fi
 fi
 
-# Only add pretrained_ckpt if NOT resuming
+# Only add pretrained_ckpt if NOT resuming and NOT stage1
 # When resuming, the checkpoint already contains all weights
-if [[ "$WILL_RESUME" == false ]]; then
+if [[ "$WILL_RESUME" == false ]] && [[ "$IS_STAGE1" == false ]]; then
     EXTRA_ARGS="$EXTRA_ARGS --pretrained_ckpt=${PRETRAINED_CHECKPOINT_PATH}"
 fi
 

@@ -33,6 +33,7 @@ model_cfg:
   save_val_visualizations: true
   val_vis_interval: 200
   val_vis_max_per_epoch: 4
+  train_vis_interval: 10
 
   # Loss weights (Gaussian + Norm)
   lambda_gaussian: 2

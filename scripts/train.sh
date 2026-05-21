@@ -40,10 +40,21 @@ if [[ -n "$WORK_DIR" ]] && [[ -d "$WORK_DIR/ckpt" ]]; then
     fi
 fi
 
-# Only add pretrained_ckpt if NOT resuming and NOT stage1
+# Only add pretrained_ckpt if NOT resuming
 # When resuming, the checkpoint already contains all weights
-if [[ "$WILL_RESUME" == false ]] && [[ "$IS_STAGE1" == false ]]; then
-    EXTRA_ARGS="$EXTRA_ARGS --pretrained_ckpt=${PRETRAINED_CHECKPOINT_PATH}"
+if [[ "$WILL_RESUME" == false ]]; then
+    # For Stage1: use PRETRAINED_CHECKPOINT_PATH env var if set, otherwise train from scratch
+    if [[ "$IS_STAGE1" == true ]]; then
+        if [[ -n "${PRETRAINED_CHECKPOINT_PATH:-}" ]]; then
+            echo "Stage1 mode: loading pretrained checkpoint from ${PRETRAINED_CHECKPOINT_PATH}"
+            EXTRA_ARGS="$EXTRA_ARGS --pretrained_ckpt=${PRETRAINED_CHECKPOINT_PATH}"
+        else
+            echo "Stage1 mode: training from scratch (set PRETRAINED_CHECKPOINT_PATH to load a checkpoint)"
+        fi
+    else
+        # For Stage2: always load Stage1 checkpoint
+        EXTRA_ARGS="$EXTRA_ARGS --pretrained_ckpt=${PRETRAINED_CHECKPOINT_PATH}"
+    fi
 fi
 
 # Warmup gsplat CUDA JIT cache with a single process before launching DDP.

@@ -710,6 +710,7 @@ class ReconDrive_LITModelModule(pl.LightningModule):
     def __init__(self, cfg, save_dir='.', logger=None):
         super().__init__()
         self.read_config(cfg)
+        self.enable_nan_checks = getattr(self, 'enable_nan_checks', True)
 
         # Set default values for ego transformation configuration if not in config
         if not hasattr(self, 'translate_3dgs'):
@@ -1128,9 +1129,7 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             print('inf_prams: ',inf_params)
             
             sys.exit(-1)
-        
 
-        
         for optimizer in self.trainer.optimizers:
             for i, param_group in enumerate(optimizer.param_groups):
                 for j, param in enumerate(param_group['params']):
@@ -1180,6 +1179,30 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             
             sys.exit(-1)
     
+    def _check_finite(self, tensor, name):
+        if not self.enable_nan_checks or tensor is None or not torch.is_tensor(tensor):
+            return
+        finite_mask = torch.isfinite(tensor)
+        if finite_mask.all().item():
+            return
+        nonfinite = (~finite_mask).sum().item()
+        total = tensor.numel()
+        if finite_mask.any().item():
+            finite_vals = tensor[finite_mask]
+            min_val = finite_vals.min().item()
+            max_val = finite_vals.max().item()
+        else:
+            min_val = float('nan')
+            max_val = float('nan')
+        stage = getattr(self, 'stage', 'unknown')
+        step = getattr(self, 'global_step', 'n/a')
+        msg = (
+            f"[NaNCheck] {name} has non-finite values "
+            f"({nonfinite}/{total}). min={min_val}, max={max_val}, stage={stage}, step={step}"
+        )
+        print(msg)
+        raise RuntimeError(msg)
+
     def on_before_optimizer_step(self, optimizer):
         
         valid_gradients = True
@@ -1516,6 +1539,16 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         else:
             depth_maps, rot_maps, scale_maps, opacity_maps, sh_maps, forward_flow = model_out
             occ_logits = None
+            offset_maps = None
+        if self.enable_nan_checks:
+            self._check_finite(depth_maps, "depth_maps")
+            self._check_finite(rot_maps, "rot_maps")
+            self._check_finite(scale_maps, "scale_maps")
+            self._check_finite(opacity_maps, "opacity_maps")
+            self._check_finite(sh_maps, "sh_maps")
+            self._check_finite(forward_flow, "forward_flow")
+            self._check_finite(offset_maps, "offset_maps")
+            self._check_finite(occ_logits, "occ_logits")
         del image_list
         batch_size = depth_maps.shape[0]
         frame_camrea = depth_maps.shape[1]
@@ -1542,6 +1575,8 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             if gaussians_per_voxel > 1:
                 bfc_xyz = bfc_xyz.unsqueeze(2).expand(-1, -1, gaussians_per_voxel, -1)
                 bfc_xyz = bfc_xyz.reshape(bfc_xyz.shape[0], -1, 3)
+        if self.enable_nan_checks:
+            self._check_finite(bfc_xyz, "bfc_xyz")
 
         if sh_maps.dim() == 7:
             bfc_sh = rearrange(sh_maps, 'b c h w k p d -> (b c) h w k p d')
@@ -1551,6 +1586,8 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             bfc_sh = rearrange(sh_maps, 'b c h w p d -> (b c) h w p d')
             c2w_rotations = rearrange(bfc_c2e[:, :3, :3], "b i j -> b () () () i j")
             bfc_sh = rotate_sh(bfc_sh, c2w_rotations)
+        if self.enable_nan_checks:
+            self._check_finite(bfc_sh, "bfc_sh")
 
         # Transform rot_maps from camera frame to ego frame
         # rot_maps shape: [batch, num_cams, h, w, 4]
@@ -2099,6 +2136,8 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                 )
 
                 projected_depth = projected_depth.unsqueeze(1)
+                if self.enable_nan_checks:
+                    self._check_finite(projected_depth, f"projected_depths[{frame_id},{cam_id}]")
                 projected_depths[('projected_depths', frame_id, cam_id)] = projected_depth
 
                 if ('gt_depths', frame_id, cam_id) in render_data:
@@ -2250,6 +2289,10 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                         outputs[('gaussian_alpha', frame_id, cam_id)], dim=0
                     ).contiguous()
                     outputs[('gaussian_alpha', frame_id, cam_id)] = gaussian_alpha
+                if self.enable_nan_checks:
+                    self._check_finite(gaussian_color, f"gaussian_color[{frame_id},{cam_id}]")
+                    if ('gaussian_alpha', frame_id, cam_id) in outputs:
+                        self._check_finite(gaussian_alpha, f"gaussian_alpha[{frame_id},{cam_id}]")
 
                 if self.render_cam_mode=='shift':
                     ref_mask = render_data[('gt_mask',frame_id,cam_id)]
@@ -2270,6 +2313,8 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
                 outputs[('gaussian_color', frame_id, cam_id)] = gaussian_color
                 outputs[('warped_mask', frame_id, cam_id)] = mask_warped.detach()
+                if self.enable_nan_checks:
+                    self._check_finite(mask_warped, f"warped_mask[{frame_id},{cam_id}]")
 
         return outputs
     
@@ -2518,11 +2563,19 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                 pred = batch_data[('gaussian_color', frame_id, cam_id)]
                 gt = batch_data[('groudtruth', frame_id, cam_id)]  
                 mask = batch_data[('warped_mask', frame_id, cam_id)]
+                if self.enable_nan_checks:
+                    self._check_finite(pred, f"gaussian_color[{frame_id},{cam_id}]")
+                    self._check_finite(gt, f"groudtruth[{frame_id},{cam_id}]")
+                    self._check_finite(mask, f"warped_mask[{frame_id},{cam_id}]")
 
                 lpips_loss = self.lpips(pred, gt, normalize=True)
+                if self.enable_nan_checks:
+                    self._check_finite(lpips_loss, f"lpips_loss[{frame_id},{cam_id}]")
                 # lpips_loss = 0.0
                 l2_loss = ((pred - gt)**2)
                 sum_loss = 1 * l2_loss + 0.05 * lpips_loss
+                if self.enable_nan_checks:
+                    self._check_finite(sum_loss, f"gaussian_sum_loss[{frame_id},{cam_id}]")
                 gaussian_loss += compute_masked_loss(sum_loss, mask, eps=0.1)
                 count += 1
         return self.lambda_gaussian * gaussian_loss / count
@@ -2569,6 +2622,10 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                 gt_depth = batch_recontrast_data[('gt_depths', frame_id, cam_id)]
                 pred_depth = batch_recontrast_data[('projected_depths', frame_id, cam_id)]
                 gaussian_color = batch_recontrast_data[('gaussian_color', frame_id, cam_id)]
+                if self.enable_nan_checks:
+                    self._check_finite(gt_depth, f"gt_depths[{frame_id},{cam_id}]")
+                    self._check_finite(pred_depth, f"projected_depths[{frame_id},{cam_id}]")
+                    self._check_finite(gaussian_color, f"gaussian_color[{frame_id},{cam_id}]")
 
                 mask_depth = torch.logical_and(gt_depth > self.min_depth, gt_depth < self.max_depth)
                 mask_depth = mask_depth.to(torch.float32)
@@ -2576,11 +2633,15 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                 abs_diff = torch.abs(gt_depth - pred_depth) * mask_depth
                 l1loss = torch.where(abs_diff < beta, 0.5 * abs_diff * abs_diff / beta, abs_diff - 0.5 * beta)
                 l1loss = torch.sum(l1loss) / (torch.sum(mask_depth) + eps)
+                if self.enable_nan_checks:
+                    self._check_finite(l1loss, f"depth_l1loss[{frame_id},{cam_id}]")
                 depth_loss += l1loss * self.lambda_depth
                 
                 mean_disp = pred_depth.mean(2, True).mean(3, True)
                 norm_disp = pred_depth / (mean_disp + 1e-8)
                 edge_loss = compute_edg_smooth_loss(gaussian_color, norm_disp)
+                if self.enable_nan_checks:
+                    self._check_finite(edge_loss, f"edge_loss[{frame_id},{cam_id}]")
                 depth_loss += self.lambda_edge * edge_loss
 
                 # Save intermediate visualization images
@@ -2608,6 +2669,8 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             return torch.tensor(0.0, device=self.device)
 
         occ_logits = batch_recontrast_data['occ_logits']  # [B, S, 200, 200, 16, 18]
+        if self.enable_nan_checks:
+            self._check_finite(occ_logits, "occ_logits")
 
         # 获取真值
         occ_gt = batch_input.get('context_frames', {}).get('occ_semantics', None)
@@ -2624,6 +2687,8 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         if not isinstance(occ_gt, torch.Tensor):
             occ_gt = torch.from_numpy(occ_gt).to(self.device)
         occ_gt = occ_gt.long()  # [B, 200, 200, 16]
+        if self.enable_nan_checks:
+            self._check_finite(occ_gt, "occ_gt")
 
         # 取第一帧（Stage 1 只有单帧）
         if occ_logits.dim() == 6:  # [B, S, 200, 200, 16, 18]
@@ -2637,6 +2702,8 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         loss = torch.nn.functional.cross_entropy(
             logits_flat, gt_flat, ignore_index=0, reduction='mean'
         )
+        if self.enable_nan_checks:
+            self._check_finite(loss, "occ_loss")
 
         return self.lambda_occ * loss
 

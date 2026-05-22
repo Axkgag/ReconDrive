@@ -16,6 +16,7 @@ model_cfg:
   num_cams: 6
   embed_dim: 1024
   auto_scale_lr: True
+  enable_nan_checks: true
   learning_rate: 0.00001
   weight_decay: 0.01
   lr_restart_epoch: 5
@@ -53,6 +54,7 @@ model_cfg:
   lambda_opacity: 0.01
   lambda_edge: 0.1
   lambda_depth: 0.001
+  enable_depth_supervision: false
 
   # Occ 监督配置（引用统一开关）
   enable_occ_supervision: *enable_occ  # 引用全局开关

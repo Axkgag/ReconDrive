@@ -66,5 +66,5 @@ data_cfg:
   batch_size: 8
   data_shuffle: True
   drop_last: False
-  num_workers: 4
+  num_workers: 2
   num_epochs: 10

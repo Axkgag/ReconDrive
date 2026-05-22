@@ -32,8 +32,9 @@ class ReconDriveStage1_LITModelModule(ReconDrive_LITModelModule):
             param.requires_grad = False
 
         # Unfreeze depth_head and gs_head.
-        for param in self.model.depth_head.parameters():
-            param.requires_grad = True
+        if hasattr(self, "enable_depth_supervision"):
+            for param in self.model.depth_head.parameters():
+                param.requires_grad = self.enable_depth_supervision
         for param in self.model.gs_head.parameters():
             param.requires_grad = True
 
@@ -87,7 +88,10 @@ class ReconDriveStage1_LITModelModule(ReconDrive_LITModelModule):
         )
 
         loss_gaussian = self.compute_gaussian_loss(batch_splating_data)
-        loss_depth = self.compute_depth_loss(batch_splating_data)
+        if hasattr(self, "enable_depth_supervision") and self.enable_depth_supervision:
+            loss_depth = self.compute_depth_loss(batch_splating_data)
+        else:
+            loss_depth = torch.tensor(0.0, device=self.device)
 
         # 新增：计算 Occ 损失（仅在启用时）
         if getattr(self.model.gs_head, 'enable_occ', False):

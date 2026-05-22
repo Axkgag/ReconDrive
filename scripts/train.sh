@@ -3,9 +3,10 @@
 # Example: bash scripts/train.sh 1 configs/nuscenes/recondrive_ae.yaml ./work_dirs/ae_exp1 ./tensorboard_logs
 
 CONFIG_PATH="${2:-./configs/nuscenes/recondrive.yaml}"
-PRETRAINED_CHECKPOINT_PATH='./checkpoints/recondrive_stage1.ckpt'
+# PRETRAINED_CHECKPOINT_PATH='./checkpoints/recondrive_stage1.ckpt'
 WORK_DIR="${3:-}"
 TENSORBOARD_DIR="${4:-}"
+PRETRAINED_CHECKPOINT_PATH="${5:-}"
 EXTRA_ARGS=""
 WILL_RESUME=false
 IS_STAGE1=false

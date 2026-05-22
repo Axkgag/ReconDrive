@@ -1,10 +1,14 @@
-save_dir: './work_dirs/recondrive_stage1_training'
+save_dir: './work_dirs/recondrive_stage1_voxel_training'
 seed: 42
 train_epoch: 20
 devices: [0,1,2,3,4,5,6,7]
 
+# Occ 监督统一开关（定义锚点，只需在此处修改）
+enable_occ: &enable_occ false  # 设为 true 启用 Occ 监督功能
+
 model_cfg:
   use_stage1: true
+  model_variant: 'voxel'
   height: 280
   width: 518
   render_width_min: 259
@@ -29,11 +33,19 @@ model_cfg:
   focal_length_scale: 300
   sh_degree: 4
 
+  # Voxel settings
+  voxel_size: 0.4
+  voxel_x_range: [-40.0, 40.0]
+  voxel_y_range: [-40.0, 40.0]
+  voxel_z_range: [-1.0, 5.4]
+  voxel_feature_dim: 256
+  voxel_gaussians_per_voxel: 4
+
   save_image_duration: 100
   save_val_visualizations: true
   val_vis_interval: 200
   val_vis_max_per_epoch: 4
-  train_vis_interval: 10
+  train_vis_interval: 50
 
   # Loss weights (Gaussian + Norm)
   lambda_gaussian: 2
@@ -41,6 +53,10 @@ model_cfg:
   lambda_opacity: 0.01
   lambda_edge: 0.1
   lambda_depth: 0.001
+
+  # Occ 监督配置（引用统一开关）
+  enable_occ_supervision: *enable_occ  # 引用全局开关
+  lambda_occ: 0.5  # Occ 损失权重（启用时生效）
 
   # Model checkpoint paths
   vggt_checkpoint: 'checkpoints/vggt.pt'
@@ -63,7 +79,12 @@ data_cfg:
   train_requirements: (gt_pose, gt_ego_pose, gt_depth, mask)
   val_requirements: (gt_pose, gt_ego_pose, gt_depth, mask)
 
-  batch_size: 8
+  occ_data_path: '/your/path/to/OccWM/data/nuscenes/OCC'
+  # Occ 数据加载配置（引用统一开关）
+  with_occ: *enable_occ  # 引用全局开关，与 model_cfg 保持同步
+  filter_missing_occ: *enable_occ  # 设为 true 时跳过没有 Occ 数据的样本
+
+  batch_size: 2
   data_shuffle: True
   drop_last: False
   num_workers: 4

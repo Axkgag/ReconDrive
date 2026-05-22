@@ -37,6 +37,7 @@ from torch.utils.checkpoint import checkpoint
 from models.vggt.models.vggt import VGGT
 from models.vggt.heads.dpt_head import DPTHead
 from models.vggt.heads.gs_dpt_head import VGGT_DPT_GS_Head
+from models.vggt.heads.voxel_gs_head import VGGT_Voxel_GS_Head
 from models.gaussian_util import render, focal2fov, getProjectionMatrix, depth2pc, pc2depth, rotate_sh, quat_multiply
 from models.loss_util import compute_photometric_loss, compute_masked_loss, compute_edg_smooth_loss
 from utils.visual_util import predictions_to_glb
@@ -563,6 +564,148 @@ class ReconDriveModel(torch.nn.Module):
         return voxel_pts, voxel_feats
 
 
+class ReconDriveVoxelModel(torch.nn.Module):
+    def __init__(
+        self,
+        sh_degree,
+        min_depth,
+        max_depth,
+        vggt_checkpoint="./checkpoints/vggt.pt",
+        voxel_size: float = 0.4,
+        voxel_x_range=(-40.0, 40.0),
+        voxel_y_range=(-40.0, 40.0),
+        voxel_z_range=(-1.0, 5.4),
+        voxel_feature_dim: int = 256,
+        gaussians_per_voxel: int = 1,
+        enable_occ: bool = False,
+    ):
+        super().__init__()
+        self.img_size = 518
+        self.patch_size = 14
+        self.embed_dim = 1024
+        self.sh_degree = sh_degree
+        self.min_depth = min_depth
+        self.max_depth = max_depth
+        self.voxel_size = voxel_size
+
+        vggt_model = VGGT()
+        vggt_model.load_state_dict(torch.load(vggt_checkpoint))
+
+        self.aggregator = apply_lora(
+            vggt_model.aggregator,
+            layer_names=['qkv', 'proj', 'fc1', 'fc2'],
+            dropout=0.05
+        )
+        verify_frozen_parameters(self.aggregator)
+        self.depth_head = vggt_model.depth_head
+        del vggt_model
+
+        self.d_sh = (self.sh_degree + 1) ** 2
+        self.register_buffer(
+            "sh_mask",
+            torch.ones((self.d_sh,), dtype=torch.float32),
+            persistent=False,
+        )
+        for degree in range(1, self.sh_degree + 1):
+            self.sh_mask[degree**2: (degree + 1) ** 2] = 0.1 * 0.25**degree
+
+        self.raw_gs_dim = 3 + 4 + 3 + 1 + 3 * self.d_sh
+
+        self.gs_head = VGGT_Voxel_GS_Head(
+            dim_in=2 * self.embed_dim,
+            patch_size=self.patch_size,
+            sh_degree=self.sh_degree,
+            feature_dim=voxel_feature_dim,
+            gaussians_per_voxel=gaussians_per_voxel,
+            voxel_size=voxel_size,
+            x_range=tuple(voxel_x_range),
+            y_range=tuple(voxel_y_range),
+            z_range=tuple(voxel_z_range),
+            enable_occ=enable_occ,
+        )
+
+        self.track_head = None
+
+    def forward(self, images, intrinsics, extrinsics):
+        """
+        images: [B, V, 3, H, W]
+        intrinsics: [B, V, 4, 4] or [B, V, 3, 3]
+        extrinsics: [B, V, 4, 4] (camera-to-ego)
+        """
+        with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
+            aggregated_tokens_list, patch_start_idx = self.aggregator(images.to(torch.bfloat16))
+
+        with torch.amp.autocast("cuda", enabled=False):
+            depth_maps, depth_conf = self.depth_head(
+                aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx
+            )
+
+            depth_maps = torch.nn.functional.sigmoid(torch.log(depth_maps))
+            depth_range = self.max_depth - self.min_depth
+            depth_maps = self.min_depth + depth_range * depth_maps
+
+            # 根据是否启用 Occ 决定调用方式
+            if self.gs_head.enable_occ:
+                raw_gaussian, occ_logits = self.gs_head(
+                    aggregated_tokens_list,
+                    images=images,
+                    patch_start_idx=patch_start_idx,
+                    depth_maps=depth_maps,
+                    intrinsics=intrinsics,
+                    extrinsics=extrinsics,
+                    return_occ_logits=True,
+                )
+            else:
+                raw_gaussian = self.gs_head(
+                    aggregated_tokens_list,
+                    images=images,
+                    patch_start_idx=patch_start_idx,
+                    depth_maps=depth_maps,
+                    intrinsics=intrinsics,
+                    extrinsics=extrinsics,
+                )
+                occ_logits = None
+
+            offset_maps, rot_maps, scale_maps, opacity_maps, sh_maps = raw_gaussian.split(
+                (3, 4, 3, 1, 3 * self.d_sh), dim=-1
+            )
+
+            offset_maps = torch.tanh(offset_maps) * (self.voxel_size * 0.5)
+            rot_maps = rot_maps / (rot_maps.norm(dim=-1, keepdim=True) + 1e-8)
+            scale_maps = nn.functional.softplus(scale_maps, beta=1) * 0.01
+            opacity_maps = nn.functional.sigmoid(opacity_maps)
+
+            if sh_maps.dim() == 6:
+                sh_maps = rearrange(sh_maps, "b n h w k (i c) -> b n h w k i c", i=3)
+            else:
+                sh_maps = rearrange(sh_maps, "b n h w (i c) -> b n h w i c", i=3)
+            sh_maps = sh_maps * self.sh_mask
+
+            if self.track_head is not None:
+                forward_flow = self.track_head(
+                    aggregated_tokens_list,
+                    images,
+                    patch_start_idx=patch_start_idx,
+                    motion_tokens=None,
+                )
+            else:
+                b, v, h, w, _ = depth_maps.shape
+                forward_flow = torch.zeros(b, v, h, w, 3, dtype=depth_maps.dtype, device=depth_maps.device)
+
+        ret_dict = {
+            "depth_maps": depth_maps,
+            "rot_maps": rot_maps,
+            "scale_maps": scale_maps,
+            "opacity_maps": opacity_maps,
+            "sh_maps": sh_maps,
+            "forward_flow": forward_flow,
+            "offset_maps": offset_maps,
+        }
+        if occ_logits is not None:
+            ret_dict["occ_logits"] = occ_logits
+        return ret_dict
+
+
 class ReconDrive_LITModelModule(pl.LightningModule):
     def __init__(self, cfg, save_dir='.', logger=None):
         super().__init__()
@@ -575,7 +718,28 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
         self.save_dir = save_dir
         vggt_checkpoint = getattr(self, 'vggt_checkpoint', './checkpoints/vggt.pt')
-        self.model = ReconDriveModel(sh_degree=self.sh_degree,min_depth=self.min_depth, max_depth=self.max_depth, vggt_checkpoint=vggt_checkpoint) 
+        self.model_variant = getattr(self, 'model_variant', 'standard')
+        if self.model_variant == 'voxel':
+            self.model = ReconDriveVoxelModel(
+                sh_degree=self.sh_degree,
+                min_depth=self.min_depth,
+                max_depth=self.max_depth,
+                vggt_checkpoint=vggt_checkpoint,
+                voxel_size=getattr(self, 'voxel_size', 0.4),
+                voxel_x_range=getattr(self, 'voxel_x_range', [-40.0, 40.0]),
+                voxel_y_range=getattr(self, 'voxel_y_range', [-40.0, 40.0]),
+                voxel_z_range=getattr(self, 'voxel_z_range', [-1.0, 5.4]),
+                voxel_feature_dim=getattr(self, 'voxel_feature_dim', 256),
+                gaussians_per_voxel=getattr(self, 'voxel_gaussians_per_voxel', 1),
+                enable_occ=getattr(self, 'enable_occ_supervision', False),
+            )
+        else:
+            self.model = ReconDriveModel(
+                sh_degree=self.sh_degree,
+                min_depth=self.min_depth,
+                max_depth=self.max_depth,
+                vggt_checkpoint=vggt_checkpoint,
+            )
         self.lpips = LPIPS(net="vgg", pretrained=False, model_path='/data_map/liangyihao/ReconDrive/checkpoints/lpips_vgg.pth')
         self.ssim_fn = SSIMLoss(window_size=11,reduction='none')
         self.l1_fn = torch.nn.L1Loss(reduction='none')
@@ -1334,7 +1498,24 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
         # 6 -> 18
         # [4, 6, 280, 518, 1], [4, 6, 280, 518, 4], [4, 6, 280, 518, 3], [4, 6, 280, 518, 1], [4, 6, 280, 518, 3, 25], [4, 6, 280, 518, 3]
-        depth_maps, rot_maps, scale_maps, opacity_maps, sh_maps, forward_flow = self.model(image_list)
+        offset_maps = None
+        if getattr(self, 'model_variant', 'standard') == 'voxel':
+            model_out = self.model(image_list, inputs['K'], inputs['c2e_extr'])
+        else:
+            model_out = self.model(image_list)
+
+        if isinstance(model_out, dict):
+            depth_maps = model_out['depth_maps']
+            rot_maps = model_out['rot_maps']
+            scale_maps = model_out['scale_maps']
+            opacity_maps = model_out['opacity_maps']
+            sh_maps = model_out['sh_maps']
+            forward_flow = model_out['forward_flow']
+            offset_maps = model_out.get('offset_maps', None)
+            occ_logits = model_out.get('occ_logits', None)
+        else:
+            depth_maps, rot_maps, scale_maps, opacity_maps, sh_maps, forward_flow = model_out
+            occ_logits = None
         del image_list
         batch_size = depth_maps.shape[0]
         frame_camrea = depth_maps.shape[1]
@@ -1344,29 +1525,54 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         bfc_depth_maps = rearrange(depth_maps.squeeze(-1), 'b c h w -> (b c) h w ')
         bfc_K = rearrange(inputs['K'], 'b c i j -> (b c) i j ')
         bfc_c2e = rearrange(c2e_extr_list, 'b c i j -> (b c) i j ')
-        bfc_sh = rearrange(sh_maps, 'b c h w p d -> (b c) h w p d') # height weight points d_sh
 
         # bfc_xyz = self._unproject_depth_map_to_points_map(bfc_depth_maps, bfc_K, bfc_c2e)
         bf_e2c = torch.linalg.inv(bfc_c2e)
         bfc_xyz = depth2pc(bfc_depth_maps, bf_e2c, bfc_K)
 
-        c2w_rotations = rearrange(bfc_c2e[:, :3, :3], "b i j -> b () () () i j")
+        gaussians_per_voxel = rot_maps.shape[-2] if rot_maps.dim() == 6 else 1
+        if offset_maps is not None and offset_maps.dim() == 6:
+            bfc_offset = rearrange(offset_maps, 'b c h w k d -> (b c) (h w) k d')
+            bfc_xyz = bfc_xyz.unsqueeze(2) + bfc_offset
+            bfc_xyz = bfc_xyz.reshape(bfc_xyz.shape[0], -1, 3)
+        else:
+            if offset_maps is not None:
+                bfc_offset = rearrange(offset_maps, 'b c h w d -> (b c) (h w) d')
+                bfc_xyz = bfc_xyz + bfc_offset
+            if gaussians_per_voxel > 1:
+                bfc_xyz = bfc_xyz.unsqueeze(2).expand(-1, -1, gaussians_per_voxel, -1)
+                bfc_xyz = bfc_xyz.reshape(bfc_xyz.shape[0], -1, 3)
 
-        bfc_sh = rotate_sh(bfc_sh, c2w_rotations)
+        if sh_maps.dim() == 7:
+            bfc_sh = rearrange(sh_maps, 'b c h w k p d -> (b c) h w k p d')
+            c2w_rotations = rearrange(bfc_c2e[:, :3, :3], "b i j -> b () () () () i j")
+            bfc_sh = rotate_sh(bfc_sh, c2w_rotations)
+        else:
+            bfc_sh = rearrange(sh_maps, 'b c h w p d -> (b c) h w p d')
+            c2w_rotations = rearrange(bfc_c2e[:, :3, :3], "b i j -> b () () () i j")
+            bfc_sh = rotate_sh(bfc_sh, c2w_rotations)
 
         # Transform rot_maps from camera frame to ego frame
         # rot_maps shape: [batch, num_cams, h, w, 4]
         # bfc_c2e shape: [(batch*num_cams), 4, 4]
-        bfc_rot_maps = rearrange(rot_maps, 'b c h w d -> (b c) (h w) d', d=4)
+        if rot_maps.dim() == 6:
+            bfc_rot_maps = rearrange(rot_maps, 'b c h w k d -> (b c) (h w k) d', d=4)
+        else:
+            bfc_rot_maps = rearrange(rot_maps, 'b c h w d -> (b c) (h w) d', d=4)
 
         outputs['pred_depths'] = rearrange(bfc_depth_maps, '(b c) h w -> b (c h w)', b=batch_size, c=frame_camrea)#.contiguous()
 
         outputs['xyz'] = rearrange(bfc_xyz, '(b c) p k -> b (c p) k', b=batch_size, c=frame_camrea)#.contiguous()
         outputs['rot_maps'] = rearrange(bfc_rot_maps, '(b c) p d -> b (c p) d', b=batch_size, c=frame_camrea, d=4)#.contiguous()
 
-        outputs['scale_maps'] = rearrange(scale_maps, 'b c h w d -> b (c h w) d', d=3)#.contiguous()
-        outputs['opacity_maps'] = rearrange(opacity_maps, 'b c h w d -> b (c h w) d')#.contiguous()
-        outputs['sh_maps'] = rearrange(bfc_sh, '(b c) h w p d -> b (c h w) d p', b=batch_size, c=frame_camrea)#.contiguous()
+        if scale_maps.dim() == 6:
+            outputs['scale_maps'] = rearrange(scale_maps, 'b c h w k d -> b (c h w k) d', d=3)#.contiguous()
+            outputs['opacity_maps'] = rearrange(opacity_maps, 'b c h w k d -> b (c h w k) d')#.contiguous()
+            outputs['sh_maps'] = rearrange(bfc_sh, '(b c) h w k p d -> b (c h w k) d p', b=batch_size, c=frame_camrea)#.contiguous()
+        else:
+            outputs['scale_maps'] = rearrange(scale_maps, 'b c h w d -> b (c h w) d', d=3)#.contiguous()
+            outputs['opacity_maps'] = rearrange(opacity_maps, 'b c h w d -> b (c h w) d')#.contiguous()
+            outputs['sh_maps'] = rearrange(bfc_sh, '(b c) h w p d -> b (c h w) d p', b=batch_size, c=frame_camrea)#.contiguous()
 
         # Generate vehicle-based 3D velocity flow
         if self.use_vehicle_flow:
@@ -1468,8 +1674,12 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                     empty_masks = torch.zeros(frame_camrea, self.height, self.width, dtype=torch.bool, device=depth_maps.device)
                     all_vehicle_masks.append(empty_masks)
 
-            # Reshape to final format [b, (c*h*w), 3]
-            outputs['forward_flow'] = rearrange(torch.stack(new_forward_flow), 'b c h w d -> b (c h w) d')
+            flow_tensor = torch.stack(new_forward_flow)
+            if gaussians_per_voxel > 1:
+                flow_tensor = flow_tensor.unsqueeze(4).expand(-1, -1, -1, -1, gaussians_per_voxel, -1)
+                outputs['forward_flow'] = rearrange(flow_tensor, 'b c h w k d -> b (c h w k) d')
+            else:
+                outputs['forward_flow'] = rearrange(flow_tensor, 'b c h w d -> b (c h w) d')
             # Store vehicle masks as tensor for unified format [b, c, h, w]
             if len(all_vehicle_masks) > 0:
                 outputs['vehicle_masks'] = torch.stack(all_vehicle_masks)
@@ -1478,7 +1688,11 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
         else:
             # Use original flow from model
-            outputs['forward_flow'] = rearrange(forward_flow, 'b c h w d -> b (c h w) d')#.contiguous()
+            if gaussians_per_voxel > 1:
+                flow_tensor = forward_flow.unsqueeze(4).expand(-1, -1, -1, -1, gaussians_per_voxel, -1)
+                outputs['forward_flow'] = rearrange(flow_tensor, 'b c h w k d -> b (c h w k) d')
+            else:
+                outputs['forward_flow'] = rearrange(forward_flow, 'b c h w d -> b (c h w) d')#.contiguous()
             outputs['vehicle_masks'] = None  # No vehicle masks when not using vehicle flow
 
         # Perform ICP refinement early if we have multiple frames (needed for ego pose and velocity refinement)
@@ -1627,6 +1841,10 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             outputs['xyz_transformed'] = outputs['xyz']
             outputs['rot_maps_transformed'] = outputs['rot_maps']
             outputs['sh_maps_transformed'] = outputs['sh_maps']
+
+        # Add occ_logits to outputs if available
+        if occ_logits is not None:
+            outputs['occ_logits'] = occ_logits
 
         del bfc_K, bfc_c2e, bfc_depth_maps, bfc_xyz, rot_maps, scale_maps, opacity_maps, bfc_sh,
         return outputs
@@ -2375,14 +2593,52 @@ class ReconDrive_LITModelModule(pl.LightningModule):
     def compute_norm_loss(self, batch_data):
 
         scale_loss = self.lambda_scale * torch.mean(torch.norm(batch_data['scale_maps'], dim=-1))
-        
-        
+
+
         opacity_loss = self.lambda_opacity * torch.mean(torch.abs(batch_data['opacity_maps']))
-        
-        
+
+
         total_reg_loss = scale_loss + opacity_loss
 
         return total_reg_loss
+
+    def compute_occ_loss(self, batch_recontrast_data, batch_input):
+        """计算 Occupancy 预测损失"""
+        if 'occ_logits' not in batch_recontrast_data:
+            return torch.tensor(0.0, device=self.device)
+
+        occ_logits = batch_recontrast_data['occ_logits']  # [B, S, 200, 200, 16, 18]
+
+        # 获取真值
+        occ_gt = batch_input.get('context_frames', {}).get('occ_semantics', None)
+        if occ_gt is None:
+            return torch.tensor(0.0, device=self.device)
+
+        # 处理列表/元组格式
+        if isinstance(occ_gt, (list, tuple)):
+            occ_gt = occ_gt[0] if len(occ_gt) > 0 else None
+        if occ_gt is None:
+            return torch.tensor(0.0, device=self.device)
+
+        # 转换为 tensor 并 reshape
+        if not isinstance(occ_gt, torch.Tensor):
+            occ_gt = torch.from_numpy(occ_gt).to(self.device)
+        occ_gt = occ_gt.long()  # [B, 200, 200, 16]
+
+        # 取第一帧（Stage 1 只有单帧）
+        if occ_logits.dim() == 6:  # [B, S, 200, 200, 16, 18]
+            occ_logits = occ_logits[:, 0]  # [B, 200, 200, 16, 18]
+
+        # Reshape 用于交叉熵: [B*200*200*16, 18] 和 [B*200*200*16]
+        logits_flat = occ_logits.reshape(-1, 18)
+        gt_flat = occ_gt.reshape(-1)
+
+        # 计算交叉熵（忽略类别 0 = 空/未知）
+        loss = torch.nn.functional.cross_entropy(
+            logits_flat, gt_flat, ignore_index=0, reduction='mean'
+        )
+
+        return self.lambda_occ * loss
 
     @torch.no_grad()
     def compute_reconstruction_metrics(self, batch_data, stage):

@@ -44,7 +44,8 @@ class NuScenesdataset4D(Dataset):
                  num_target_timesteps: int = 4,
                  cache_dir="",
                  nuscenes_version="v1.0-trainval",
-                 context_span=6
+                 context_span=6,
+                 **kwargs
                  ):        
         super().__init__()
         self.version = nuscenes_version

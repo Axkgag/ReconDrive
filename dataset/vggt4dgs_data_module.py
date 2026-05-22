@@ -141,7 +141,10 @@ class VGGT4DGS_LITDataModule(pl.LightningDataModule):
             'with_mask': 'mask' in self.train_requirements,
             'cache_dir': self.cache_dir,
             'nuscenes_version': getattr(self, 'nuscenes_version', 'v1.0-trainval'),
-            'context_span': getattr(self, 'context_span', 6)
+            'context_span': getattr(self, 'context_span', 6),
+            'enable_occ_supervision': getattr(self, 'enable_occ_supervision', False),
+            'occ_data_path': getattr(self, 'occ_data_path', None),
+            'filter_missing_occ': getattr(self, 'filter_missing_occ', False),
         }
         stage_dict = {
             'train':'train',

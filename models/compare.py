@@ -971,7 +971,22 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
         # 6 -> 18
         # [4, 6, 280, 518, 1], [4, 6, 280, 518, 4], [4, 6, 280, 518, 3], [4, 6, 280, 518, 1], [4, 6, 280, 518, 3, 25], [4, 6, 280, 518, 3]
-        depth_maps, rot_maps, scale_maps, opacity_maps, sh_maps, forward_flow = self.model(image_list)
+        offset_maps = None
+        if getattr(self, 'model_variant', 'standard') == 'voxel':
+            model_out = self.model(image_list, inputs['K'], inputs['c2e_extr'])
+        else:
+            model_out = self.model(image_list)
+
+        if isinstance(model_out, dict):
+            depth_maps = model_out['depth_maps']
+            rot_maps = model_out['rot_maps']
+            scale_maps = model_out['scale_maps']
+            opacity_maps = model_out['opacity_maps']
+            sh_maps = model_out['sh_maps']
+            forward_flow = model_out['forward_flow']
+            offset_maps = model_out.get('offset_maps', None)
+        else:
+            depth_maps, rot_maps, scale_maps, opacity_maps, sh_maps, forward_flow = model_out
         del image_list
         batch_size = depth_maps.shape[0]
         frame_camrea = depth_maps.shape[1]
@@ -981,20 +996,40 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         bfc_depth_maps = rearrange(depth_maps.squeeze(-1), 'b c h w -> (b c) h w ')
         bfc_K = rearrange(inputs['K'], 'b c i j -> (b c) i j ')
         bfc_c2e = rearrange(c2e_extr_list, 'b c i j -> (b c) i j ')
-        bfc_sh = rearrange(sh_maps, 'b c h w p d -> (b c) h w p d') # height weight points d_sh
 
         # bfc_xyz = self._unproject_depth_map_to_points_map(bfc_depth_maps, bfc_K, bfc_c2e)
         bf_e2c = torch.linalg.inv(bfc_c2e)
         bfc_xyz = depth2pc(bfc_depth_maps, bf_e2c, bfc_K)
 
-        c2w_rotations = rearrange(bfc_c2e[:, :3, :3], "b i j -> b () () () i j")
+        gaussians_per_voxel = rot_maps.shape[-2] if rot_maps.dim() == 6 else 1
+        if offset_maps is not None and offset_maps.dim() == 6:
+            bfc_offset = rearrange(offset_maps, 'b c h w k d -> (b c) (h w) k d')
+            bfc_xyz = bfc_xyz.unsqueeze(2) + bfc_offset
+            bfc_xyz = bfc_xyz.reshape(bfc_xyz.shape[0], -1, 3)
+        else:
+            if offset_maps is not None:
+                bfc_offset = rearrange(offset_maps, 'b c h w d -> (b c) (h w) d')
+                bfc_xyz = bfc_xyz + bfc_offset
+            if gaussians_per_voxel > 1:
+                bfc_xyz = bfc_xyz.unsqueeze(2).expand(-1, -1, gaussians_per_voxel, -1)
+                bfc_xyz = bfc_xyz.reshape(bfc_xyz.shape[0], -1, 3)
 
-        bfc_sh = rotate_sh(bfc_sh, c2w_rotations)
+        if sh_maps.dim() == 7:
+            bfc_sh = rearrange(sh_maps, 'b c h w k p d -> (b c) h w k p d')
+            c2w_rotations = rearrange(bfc_c2e[:, :3, :3], "b i j -> b () () () () i j")
+            bfc_sh = rotate_sh(bfc_sh, c2w_rotations)
+        else:
+            bfc_sh = rearrange(sh_maps, 'b c h w p d -> (b c) h w p d')
+            c2w_rotations = rearrange(bfc_c2e[:, :3, :3], "b i j -> b () () () i j")
+            bfc_sh = rotate_sh(bfc_sh, c2w_rotations)
 
         # Transform rot_maps from camera frame to ego frame
         # rot_maps shape: [batch, num_cams, h, w, 4]
         # bfc_c2e shape: [(batch*num_cams), 4, 4]
-        bfc_rot_maps = rearrange(rot_maps, 'b c h w d -> (b c) (h w) d', d=4)
+        if rot_maps.dim() == 6:
+            bfc_rot_maps = rearrange(rot_maps, 'b c h w k d -> (b c) (h w k) d', d=4)
+        else:
+            bfc_rot_maps = rearrange(rot_maps, 'b c h w d -> (b c) (h w) d', d=4)
         # Transform each camera's rotations using its c2e rotation matrix
         # bfc_rot_maps_ego = self.transform_gaussian_rotations(bfc_rot_maps, bfc_c2e)
 
@@ -1003,9 +1038,14 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         outputs['xyz'] = rearrange(bfc_xyz, '(b c) p k -> b (c p) k', b=batch_size, c=frame_camrea)#.contiguous()
         outputs['rot_maps'] = rearrange(bfc_rot_maps, '(b c) p d -> b (c p) d', b=batch_size, c=frame_camrea, d=4)#.contiguous()
 
-        outputs['scale_maps'] = rearrange(scale_maps, 'b c h w d -> b (c h w) d', d=3)#.contiguous()
-        outputs['opacity_maps'] = rearrange(opacity_maps, 'b c h w d -> b (c h w) d')#.contiguous()
-        outputs['sh_maps'] = rearrange(bfc_sh, '(b c) h w p d -> b (c h w) d p', b=batch_size, c=frame_camrea)#.contiguous()
+        if scale_maps.dim() == 6:
+            outputs['scale_maps'] = rearrange(scale_maps, 'b c h w k d -> b (c h w k) d', d=3)#.contiguous()
+            outputs['opacity_maps'] = rearrange(opacity_maps, 'b c h w k d -> b (c h w k) d')#.contiguous()
+            outputs['sh_maps'] = rearrange(bfc_sh, '(b c) h w k p d -> b (c h w k) d p', b=batch_size, c=frame_camrea)#.contiguous()
+        else:
+            outputs['scale_maps'] = rearrange(scale_maps, 'b c h w d -> b (c h w) d', d=3)#.contiguous()
+            outputs['opacity_maps'] = rearrange(opacity_maps, 'b c h w d -> b (c h w) d')#.contiguous()
+            outputs['sh_maps'] = rearrange(bfc_sh, '(b c) h w p d -> b (c h w) d p', b=batch_size, c=frame_camrea)#.contiguous()
         
         # Perform ICP refinement early if we have multiple frames (needed for ego pose and velocity refinement)
         ego_T_ego_key = ('ego_T_ego', 0, self.context_span)
@@ -1203,7 +1243,12 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                     all_vehicle_masks.append(empty_masks)
 
             # Reshape to final format [b, (c*h*w), 3]
-            outputs['forward_flow'] = rearrange(torch.stack(new_forward_flow), 'b c h w d -> b (c h w) d')
+            flow_tensor = torch.stack(new_forward_flow)
+            if gaussians_per_voxel > 1:
+                flow_tensor = flow_tensor.unsqueeze(4).expand(-1, -1, -1, -1, gaussians_per_voxel, -1)
+                outputs['forward_flow'] = rearrange(flow_tensor, 'b c h w k d -> b (c h w k) d')
+            else:
+                outputs['forward_flow'] = rearrange(flow_tensor, 'b c h w d -> b (c h w) d')
             # Store vehicle masks as tensor for unified format [b, c, h, w]
             if len(all_vehicle_masks) > 0:
                 outputs['vehicle_masks'] = torch.stack(all_vehicle_masks)
@@ -1212,7 +1257,11 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
         else:
             # Use original flow from model
-            outputs['forward_flow'] = rearrange(forward_flow, 'b c h w d -> b (c h w) d')#.contiguous()
+            if gaussians_per_voxel > 1:
+                flow_tensor = forward_flow.unsqueeze(4).expand(-1, -1, -1, -1, gaussians_per_voxel, -1)
+                outputs['forward_flow'] = rearrange(flow_tensor, 'b c h w k d -> b (c h w k) d')
+            else:
+                outputs['forward_flow'] = rearrange(forward_flow, 'b c h w d -> b (c h w) d')#.contiguous()
             outputs['vehicle_masks'] = None  # No vehicle masks when not using vehicle flow
 
         if frame_camrea > self.num_cams:

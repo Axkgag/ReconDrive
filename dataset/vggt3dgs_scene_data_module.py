@@ -197,8 +197,12 @@ class VGGT3DGS_SceneDataModule(pl.LightningDataModule):
             'with_ego_pose': 'gt_ego_pose' in self.train_requirements,
             'with_mask': 'mask' in self.train_requirements,
             'nuscenes_version': self.nuscenes_version,
+            # 从配置中读取 enable_occ_supervision 作为统一开关
+            'enable_occ_supervision': getattr(self, 'enable_occ_supervision', False),
+            'occ_data_path': getattr(self, 'occ_data_path', None),
+            'filter_missing_occ': getattr(self, 'filter_missing_occ', False),
         }
-        
+
         dataset = NuScenesDataset(self.data_path, mode, **dataset_args)
 
         return dataset

@@ -8,7 +8,34 @@ import torch
 import torch.nn as nn
 
 from models.gaussian_util import depth2pc
+from models.gaussian_autoencoder.sparse_cnn import SparseTensor, SparseEncoder, SparseDecoder, SparseLinear
 from models.vggt.heads.dpt_head import DPTHead
+
+
+# class VoxelFeatureRefiner(nn.Module):
+#     """Sparse 3D UNet-style feature refiner (VolSplat-inspired, no MinkowskiEngine)."""
+
+#     def __init__(self, feature_dim: int, hidden_dim: int = 64) -> None:
+#         super().__init__()
+#         hidden_dim = min(hidden_dim, feature_dim)
+#         channels = (hidden_dim, hidden_dim * 2, hidden_dim * 4, hidden_dim * 8)
+
+#         self.input_proj = SparseLinear(feature_dim, hidden_dim, bias=False)
+#         self.encoder = SparseEncoder(channels=channels)
+#         self.decoder = SparseDecoder(channels=channels)
+#         self.output_proj = SparseLinear(hidden_dim, feature_dim, bias=False)
+
+#     def forward(self, voxel_feats: torch.Tensor, voxel_coords: torch.Tensor) -> torch.Tensor:
+#         if voxel_feats.numel() == 0:
+#             return voxel_feats
+
+#         coords = voxel_coords.to(dtype=torch.int32)
+#         x = SparseTensor(voxel_feats, coords)
+#         x = self.input_proj(x)
+#         latent, skip1, skip2, skip3 = self.encoder(x)
+#         x = self.decoder(latent, skip1, skip2, skip3)
+#         x = self.output_proj(x)
+#         return x.F
 
 
 class VoxelFeatureRefiner(nn.Module):

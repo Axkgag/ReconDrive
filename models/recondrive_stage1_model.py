@@ -25,6 +25,8 @@ class ReconDriveStage1_LITModelModule(ReconDrive_LITModelModule):
         # Visualization settings
         self.vis_step = 0
         self._val_vis_saved_this_epoch = 0
+        if not hasattr(self, 'occ_debug_interval'):
+            self.occ_debug_interval = 200
 
     def _configure_stage1_trainable(self):
         # Freeze all parameters first.
@@ -151,6 +153,32 @@ class ReconDriveStage1_LITModelModule(ReconDrive_LITModelModule):
         self.vis_step += 1
 
         return loss_all
+
+    def on_after_backward(self):
+        if not getattr(self.model.gs_head, 'enable_occ', False):
+            return
+        debug_interval = getattr(self, 'occ_debug_interval', 0)
+        if not debug_interval:
+            return
+        if getattr(self, 'global_step', 0) % debug_interval != 0:
+            return
+        occ_decoder = getattr(self.model.gs_head, 'occ_decoder', None)
+        if occ_decoder is None:
+            return
+        grad_means = []
+        max_abs = 0.0
+        for param in occ_decoder.parameters():
+            if param.grad is None:
+                continue
+            grad = param.grad.detach()
+            grad_means.append(grad.abs().mean())
+            max_abs = max(max_abs, grad.abs().max().item())
+        step = getattr(self, 'global_step', 'n/a')
+        if grad_means:
+            mean_abs = torch.stack(grad_means).mean().item()
+            print(f"[OccGrad] step={step}, mean_abs={mean_abs:.6f}, max_abs={max_abs:.6f}")
+        else:
+            print(f"[OccGrad] step={step}, no_grad")
 
     def validation_step(self, batch_input, batch_idx):
         self.stage = stage = 'val'

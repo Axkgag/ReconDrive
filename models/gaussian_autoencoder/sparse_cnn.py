@@ -100,23 +100,39 @@ class SparseConvTranspose3d(nn.Module):
                                        padding=kernel_size//2, output_padding=stride-1, bias=False)
         self.stride = stride
 
-    def forward(self, x):
+    def forward(self, x, target_coords: torch.Tensor | None = None):
         device = x.F.device
         batch_ids = x.C[:, 0].long()
         coords_xyz = x.C[:, 1:].long()
 
         # Handle empty input
         if coords_xyz.shape[0] == 0:
-            return SparseTensor(
-                torch.zeros(0, self.conv.out_channels, device=device),
-                torch.zeros(0, 4, device=device, dtype=torch.int32)
+            if target_coords is None or target_coords.shape[0] == 0:
+                return SparseTensor(
+                    torch.zeros(0, self.conv.out_channels, device=device),
+                    torch.zeros(0, 4, device=device, dtype=torch.int32)
+                )
+            target_coords = target_coords.to(device=device, dtype=torch.int32)
+            out_features = torch.zeros(
+                target_coords.shape[0],
+                self.conv.out_channels,
+                device=device,
             )
+            return SparseTensor(out_features, target_coords)
 
         max_coords = coords_xyz.max(dim=0)[0] + 1
         grid_size = (max_coords[0].item(), max_coords[1].item(), max_coords[2].item())
 
-        out_features_list = []
-        out_coords_list = []
+        if target_coords is not None:
+            target_coords = target_coords.to(device=device, dtype=torch.int32)
+            out_features = torch.zeros(
+                target_coords.shape[0],
+                self.conv.out_channels,
+                device=device,
+            )
+        else:
+            out_features_list = []
+            out_coords_list = []
 
         for b in batch_ids.unique():
             mask = batch_ids == b
@@ -128,23 +144,38 @@ class SparseConvTranspose3d(nn.Module):
 
             out_dense = self.conv(dense)
 
-            # Upsample coordinates
-            out_coords = coords * self.stride
             out_shape = out_dense.shape[2:]
-            out_coords = torch.clamp(out_coords,
-                                     min=torch.zeros(3, device=device, dtype=torch.long),
-                                     max=torch.tensor(out_shape, device=device, dtype=torch.long) - 1)
+            out_shape_tensor = torch.tensor(out_shape, device=device, dtype=torch.long)
 
-            out_feats = out_dense[0, :, out_coords[:, 0], out_coords[:, 1], out_coords[:, 2]].T
+            if target_coords is not None:
+                target_mask = target_coords[:, 0] == b
+                if not torch.any(target_mask):
+                    continue
+                target_xyz = target_coords[target_mask][:, 1:].long()
+                valid = (target_xyz >= 0).all(dim=1) & (target_xyz < out_shape_tensor).all(dim=1)
+                if torch.any(valid):
+                    valid_xyz = target_xyz[valid]
+                    out_feats = out_dense[0, :, valid_xyz[:, 0], valid_xyz[:, 1], valid_xyz[:, 2]].T
+                    out_features[target_mask.nonzero(as_tuple=False).squeeze(1)[valid]] = out_feats
+            else:
+                # Upsample coordinates
+                out_coords = coords * self.stride
+                out_coords = torch.clamp(out_coords,
+                                         min=torch.zeros(3, device=device, dtype=torch.long),
+                                         max=out_shape_tensor - 1)
 
-            out_coords_b = torch.cat([
-                torch.full((out_coords.shape[0], 1), b, device=device, dtype=torch.int32),
-                out_coords.int()
-            ], dim=1)
+                out_feats = out_dense[0, :, out_coords[:, 0], out_coords[:, 1], out_coords[:, 2]].T
 
-            out_features_list.append(out_feats)
-            out_coords_list.append(out_coords_b)
+                out_coords_b = torch.cat([
+                    torch.full((out_coords.shape[0], 1), b, device=device, dtype=torch.int32),
+                    out_coords.int()
+                ], dim=1)
 
+                out_features_list.append(out_feats)
+                out_coords_list.append(out_coords_b)
+
+        if target_coords is not None:
+            return SparseTensor(out_features, target_coords)
         return SparseTensor(
             torch.cat(out_features_list, dim=0),
             torch.cat(out_coords_list, dim=0)
@@ -259,15 +290,15 @@ class SparseDecoder(nn.Module):
         self.act = SparseReLU(inplace=True)
 
     def forward(self, latent, skip1, skip2, skip3):
-        x = self.act(self.bn_u3(self.up3(latent)))
+        x = self.act(self.bn_u3(self.up3(latent, target_coords=skip3.C)))
         x = x + self.proj3(skip3)
         x = self.stage3(x)
 
-        x = self.act(self.bn_u2(self.up2(x)))
+        x = self.act(self.bn_u2(self.up2(x, target_coords=skip2.C)))
         x = x + self.proj2(skip2)
         x = self.stage2(x)
 
-        x = self.act(self.bn_u1(self.up1(x)))
+        x = self.act(self.bn_u1(self.up1(x, target_coords=skip1.C)))
         x = x + self.proj1(skip1)
         x = self.stage1(x)
 

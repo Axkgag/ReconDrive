@@ -2694,13 +2694,76 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         if occ_logits.dim() == 6:  # [B, S, 200, 200, 16, 18]
             occ_logits = occ_logits[:, 0]  # [B, 200, 200, 16, 18]
 
-        # Reshape 用于交叉熵: [B*200*200*16, 18] 和 [B*200*200*16]
+        # 可观测区域掩码：优先使用 occ_mask_lidar/occ_mask_camera，否则退化为有效 voxel
+        occ_mask = batch_input.get('context_frames', {}).get('occ_mask_lidar', None)
+        mask_source = 'occ_mask_lidar'
+        if occ_mask is None:
+            occ_mask = batch_input.get('context_frames', {}).get('occ_mask_camera', None)
+            mask_source = 'occ_mask_camera'
+        if isinstance(occ_mask, (list, tuple)):
+            occ_mask = occ_mask[0] if len(occ_mask) > 0 else None
+        if occ_mask is not None and not isinstance(occ_mask, torch.Tensor):
+            occ_mask = torch.from_numpy(occ_mask).to(self.device)
+        if occ_mask is not None:
+            if occ_mask.dim() == 3:
+                occ_mask = occ_mask.unsqueeze(0)
+            if occ_mask.dim() == 5 and occ_mask.shape[1] == 1:
+                occ_mask = occ_mask[:, 0]
+            if occ_mask.shape[0] == 1 and occ_gt.shape[0] > 1:
+                occ_mask = occ_mask.expand(occ_gt.shape[0], -1, -1, -1)
+            if occ_mask.shape != occ_gt.shape:
+                print(
+                    f"[OccMask] shape mismatch: occ_mask={tuple(occ_mask.shape)}, "
+                    f"occ_gt={tuple(occ_gt.shape)}. Falling back to logits mask."
+                )
+                occ_mask = None
+        if occ_mask is None:
+            mask_source = 'logits_nonzero'
+            occ_mask = (occ_logits.abs().sum(dim=-1) > 0)
+        else:
+            occ_mask = occ_mask.to(dtype=torch.bool, device=self.device)
+
+        # 只在可观测且非 unknown 的 voxel 上计算损失
+        mask_final = occ_mask & (occ_gt != 0)
+
+        debug_interval = getattr(self, 'occ_debug_interval', 0)
+        if debug_interval and getattr(self, 'global_step', 0) % debug_interval == 0:
+            with torch.no_grad():
+                occ_logits_debug = occ_logits
+                occ_pred = occ_logits_debug.argmax(dim=-1)
+                pred_flat = occ_pred.reshape(-1).detach().cpu()
+                gt_flat = occ_gt.reshape(-1).detach().cpu()
+                pred_nonempty = int(((pred_flat > 0) & (pred_flat < 17)).sum().item())
+                gt_nonempty = int(((gt_flat > 0) & (gt_flat < 17)).sum().item())
+                voxel_nonzero = int((occ_logits_debug.abs().sum(dim=-1) > 0).sum().item())
+                voxel_total = occ_logits_debug[..., 0].numel()
+                mask_obs = int(occ_mask.sum().item())
+                mask_final_cnt = int(mask_final.sum().item())
+                logits_min = occ_logits_debug.min().item()
+                logits_max = occ_logits_debug.max().item()
+                logits_mean = occ_logits_debug.mean().item()
+                stage = getattr(self, 'stage', 'unknown')
+                step = getattr(self, 'global_step', 'n/a')
+                print(
+                    f"[OccDebug] step={step}, stage={stage}, logits_shape={tuple(occ_logits_debug.shape)}, "
+                    f"gt_shape={tuple(occ_gt.shape)}, logits_min={logits_min:.4f}, "
+                    f"logits_max={logits_max:.4f}, logits_mean={logits_mean:.4f}, "
+                    f"voxel_nonzero={voxel_nonzero}, voxel_total={voxel_total}, "
+                    f"mask_source={mask_source}, mask_obs={mask_obs}, mask_final={mask_final_cnt}, "
+                    f"pred_nonempty={pred_nonempty}, gt_nonempty={gt_nonempty}"
+                )
+
+        if not mask_final.any():
+            return torch.tensor(0.0, device=self.device)
+
+        # Reshape 用于交叉熵
         logits_flat = occ_logits.reshape(-1, 18)
         gt_flat = occ_gt.reshape(-1)
+        mask_flat = mask_final.reshape(-1)
 
         # 计算交叉熵（忽略类别 0 = 空/未知）
         loss = torch.nn.functional.cross_entropy(
-            logits_flat, gt_flat, ignore_index=0, reduction='mean'
+            logits_flat[mask_flat], gt_flat[mask_flat], ignore_index=0, reduction='mean'
         )
         if self.enable_nan_checks:
             self._check_finite(loss, "occ_loss")

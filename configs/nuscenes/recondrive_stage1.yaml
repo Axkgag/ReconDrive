@@ -41,6 +41,7 @@ model_cfg:
   lambda_opacity: 0.01
   lambda_edge: 0.1
   lambda_depth: 0.001
+  enable_depth_supervision: false
 
   # Model checkpoint paths
   vggt_checkpoint: 'checkpoints/vggt.pt'

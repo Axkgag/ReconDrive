@@ -74,6 +74,7 @@ class NuScenesdataset4D(Dataset):
         cur_path = os.path.dirname(os.path.realpath(__file__))        
         self.mask_path = os.path.join(cur_path, 'nuscenes_mask')
         self.mask_loader = mask_loader_scene
+        self.occ_mask_dir = kwargs.get('occ_mask_dir', None)
 
         self.dataset = NuScenes(version=self.version, dataroot=self.path, verbose=True)
 
@@ -635,6 +636,18 @@ class NuScenesdataset4D(Dataset):
         
         return scene_samples
 
+    def _load_occ_render_masks(self, scene_name, frame_idx):
+        if self.occ_mask_dir is None:
+            return None
+        mask_file = os.path.join(self.occ_mask_dir, f"{scene_name}_{frame_idx}.npz")
+        if not os.path.exists(mask_file):
+            return None
+        try:
+            mask_data = np.load(mask_file)
+            return {cam_name: mask_data[cam_name] for cam_name in mask_data.files}
+        except Exception:
+            return None
+
     def __len__(self):
         return len(self.sample_tokens)
 
@@ -646,6 +659,9 @@ class NuScenesdataset4D(Dataset):
             contexts.append(-1)
         if self.fwd:
             contexts.append(1)
+
+        occ_masks = self._load_occ_render_masks(scene_name, frame_idx)
+        has_all_occ_masks = occ_masks is not None and all(cam in occ_masks for cam in self.cameras)
 
         # loop over all cameras
         for cam in self.cameras:
@@ -685,6 +701,10 @@ class NuScenesdataset4D(Dataset):
             if self.with_mask:
                 data.update({
                     'mask': self.mask_loader(self.mask_path, '', cam)
+                })
+            if has_all_occ_masks:
+                data.update({
+                    'occ_render_mask': occ_masks[cam]
                 })
 
             if is_key_frame:

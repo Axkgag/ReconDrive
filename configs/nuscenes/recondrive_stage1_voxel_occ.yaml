@@ -55,6 +55,8 @@ model_cfg:
   lambda_edge: 0.1
   lambda_depth: 0.001
   enable_depth_supervision: false
+  # depth_head 解冻范围: none | output_conv2 | output_conv1 | refinenet | full
+  depth_head_unfreeze: 'none'
 
   # Occ 监督配置（引用统一开关）
   enable_occ_supervision: *enable_occ  # 引用全局开关
@@ -82,6 +84,8 @@ data_cfg:
   val_requirements: (gt_pose, gt_ego_pose, gt_depth, mask)
 
   occ_data_path: './data/nuscenes/OCC'
+  occ_mask_dir_train: './data/nuscenes/occ_masks_train_rasterization'
+  occ_mask_dir_val: './data/nuscenes/occ_masks_val_rasterization'
   # Occ 数据加载配置（引用统一开关）
   enable_occ_supervision: *enable_occ  # 引用全局开关，与 model_cfg 保持同步
   filter_missing_occ: *enable_occ  # 设为 true 时跳过没有 Occ 数据的样本

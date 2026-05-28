@@ -187,6 +187,12 @@ class VGGT3DGS_SceneDataModule(pl.LightningDataModule):
             data_transform = partial(inference_transforms,
                        image_shape=(int(self.height), int(self.width)))
         
+        occ_mask_dir = getattr(self, 'occ_mask_dir', None)
+        if mode == 'train' and hasattr(self, 'occ_mask_dir_train'):
+            occ_mask_dir = self.occ_mask_dir_train
+        elif mode in ['val', 'test'] and hasattr(self, 'occ_mask_dir_val'):
+            occ_mask_dir = self.occ_mask_dir_val
+
         dataset_args = {
             'cameras': self.cameras,
             'back_context': self.back_context,
@@ -201,6 +207,7 @@ class VGGT3DGS_SceneDataModule(pl.LightningDataModule):
             'enable_occ_supervision': getattr(self, 'enable_occ_supervision', False),
             'occ_data_path': getattr(self, 'occ_data_path', None),
             'filter_missing_occ': getattr(self, 'filter_missing_occ', False),
+            'occ_mask_dir': occ_mask_dir,
         }
 
         dataset = NuScenesDataset(self.data_path, mode, **dataset_args)

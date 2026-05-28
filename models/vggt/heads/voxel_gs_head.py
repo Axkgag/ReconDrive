@@ -61,7 +61,6 @@ class VGGT_Voxel_GS_Head(nn.Module):
         y_range: Tuple[float, float] = (-40.0, 40.0),
         z_range: Tuple[float, float] = (-1.0, 5.4),
         pos_embed: bool = True,
-        enable_occ: bool = False,
     ) -> None:
         super().__init__()
         self.patch_size = patch_size
@@ -92,16 +91,6 @@ class VGGT_Voxel_GS_Head(nn.Module):
             nn.Linear(feature_dim, self.raw_gs_dim * self.gaussians_per_voxel),
         )
 
-        # Occ 解码器（仅在 enable_occ=True 时创建）
-        self.enable_occ = enable_occ
-        if self.enable_occ:
-            self.occ_num_classes = 18
-            self.occ_decoder = nn.Sequential(
-                nn.Linear(feature_dim, 128),
-                nn.ReLU(inplace=True),
-                nn.Linear(128, self.occ_num_classes),
-            )
-
     def forward(
         self,
         aggregated_tokens_list: List[torch.Tensor],
@@ -110,8 +99,7 @@ class VGGT_Voxel_GS_Head(nn.Module):
         depth_maps: torch.Tensor,
         intrinsics: torch.Tensor,
         extrinsics: torch.Tensor,
-        return_occ_logits: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> torch.Tensor:
         # 2D feature map from tokens: [B, S, C, H, W]
         features = self.feature_head(aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx)
         features = features.permute(0, 1, 3, 4, 2).contiguous()  # [B, S, H, W, C]
@@ -160,19 +148,7 @@ class VGGT_Voxel_GS_Head(nn.Module):
             )
             raw_full[:, :, self.opacity_index] = self.invalid_opacity
             raw_full_reshaped = raw_full.view(b, s, h, w, self.gaussians_per_voxel, self.raw_gs_dim)
-
-            # 如果需要返回 occ_logits，创建一个全零的 occ_logits
-            if self.enable_occ and return_occ_logits:
-                nx = int((self.x_range[1] - self.x_range[0]) / self.voxel_size)
-                ny = int((self.y_range[1] - self.y_range[0]) / self.voxel_size)
-                nz = int((self.z_range[1] - self.z_range[0]) / self.voxel_size)
-                occ_logits = torch.zeros(
-                    b, s, nx, ny, nz, self.occ_num_classes,
-                    device=device, dtype=depth.dtype
-                )
-                return raw_full_reshaped, occ_logits
-            else:
-                return raw_full_reshaped
+            return raw_full_reshaped
 
         coords = torch.stack(
             [batch_ids[valid_idx], voxel_coords[valid_idx, 0], voxel_coords[valid_idx, 1], voxel_coords[valid_idx, 2]],
@@ -196,35 +172,7 @@ class VGGT_Voxel_GS_Head(nn.Module):
         raw_full[:, :, self.opacity_index] = self.invalid_opacity
         raw_full[valid_idx] = voxel_params[inv]
         raw_full_reshaped = raw_full.view(b, s, h, w, self.gaussians_per_voxel, self.raw_gs_dim)
-
-        # 如果启用 Occ 且需要返回 Occ logits
-        if self.enable_occ and return_occ_logits:
-            # 计算 Occ logits
-            occ_logits_voxel = self.occ_decoder(voxel_feats)  # [num_voxels, 18]
-
-            # 计算网格尺寸
-            nx = int((self.x_range[1] - self.x_range[0]) / self.voxel_size)
-            ny = int((self.y_range[1] - self.y_range[0]) / self.voxel_size)
-            nz = int((self.z_range[1] - self.z_range[0]) / self.voxel_size)
-
-            # 将体素预测散射到密集网格
-            occ_logits = torch.zeros(
-                b * s, nx, ny, nz, self.occ_num_classes,
-                device=device, dtype=depth.dtype
-            )
-
-            # unique_coords: [num_voxels, 4] (batch_id, x, y, z)
-            batch_ids = unique_coords[:, 0].long()
-            x_ids = unique_coords[:, 1].long()
-            y_ids = unique_coords[:, 2].long()
-            z_ids = unique_coords[:, 3].long()
-
-            occ_logits[batch_ids, x_ids, y_ids, z_ids] = occ_logits_voxel
-            occ_logits = occ_logits.view(b, s, nx, ny, nz, self.occ_num_classes)
-
-            return raw_full_reshaped, occ_logits
-        else:
-            return raw_full_reshaped
+        return raw_full_reshaped
 
     @staticmethod
     def _ensure_4x4(matrix: torch.Tensor, device: torch.device, dtype: torch.dtype) -> torch.Tensor:

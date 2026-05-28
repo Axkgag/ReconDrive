@@ -33,17 +33,37 @@ class ReconDriveStage1_LITModelModule(ReconDrive_LITModelModule):
         for param in self.model.parameters():
             param.requires_grad = False
 
-        # Unfreeze depth_head and gs_head.
-        if hasattr(self, "enable_depth_supervision"):
-            for param in self.model.depth_head.parameters():
-                param.requires_grad = self.enable_depth_supervision
+        # Unfreeze depth head according to cfg.depth_head_unfreeze.
+        # Levels: none | output_conv2 | output_conv1 | refinenet | full
+        depth_unfreeze = getattr(self, 'depth_head_unfreeze', 'none')
+        for param in self.model.depth_head.parameters():
+            param.requires_grad = False
+        dh = self.model.depth_head
+        scratch = getattr(dh, 'scratch', None)
+        if depth_unfreeze == 'full':
+            for param in dh.parameters():
+                param.requires_grad = True
+        elif depth_unfreeze == 'refinenet' and scratch is not None:
+            for attr in ('refinenet1', 'refinenet2', 'refinenet3', 'refinenet4',
+                         'output_conv1', 'output_conv2'):
+                mod = getattr(scratch, attr, None)
+                if mod is not None:
+                    for param in mod.parameters():
+                        param.requires_grad = True
+        elif depth_unfreeze == 'output_conv1' and scratch is not None:
+            for attr in ('output_conv1', 'output_conv2'):
+                mod = getattr(scratch, attr, None)
+                if mod is not None:
+                    for param in mod.parameters():
+                        param.requires_grad = True
+        elif depth_unfreeze == 'output_conv2' and scratch is not None:
+            mod = getattr(scratch, 'output_conv2', None)
+            if mod is not None:
+                for param in mod.parameters():
+                    param.requires_grad = True
+        # 'none': all depth_head params remain frozen (already set above)
         for param in self.model.gs_head.parameters():
             param.requires_grad = True
-
-        # 新增：如果启用了 Occ，解冻 Occ 解码器参数
-        if getattr(self.model.gs_head, 'enable_occ', False):
-            for param in self.model.gs_head.occ_decoder.parameters():
-                param.requires_grad = True
 
         # Unfreeze LoRA parameters in aggregator.
         for name, param in self.model.aggregator.named_parameters():
@@ -59,13 +79,10 @@ class ReconDriveStage1_LITModelModule(ReconDrive_LITModelModule):
         )
         depth_params = sum(p.numel() for p in self.model.depth_head.parameters() if p.requires_grad)
         gs_params = sum(p.numel() for p in self.model.gs_head.parameters() if p.requires_grad)
-        occ_params = 0
-        if getattr(self.model.gs_head, 'enable_occ', False):
-            occ_params = sum(p.numel() for p in self.model.gs_head.occ_decoder.parameters() if p.requires_grad)
         print(
             "Stage1 可训练参数:",
             f"total={total_params:,}, trainable={trainable_params:,},",
-            f"lora={lora_params:,}, depth_head={depth_params:,}, gs_head={gs_params:,}, occ_decoder={occ_params:,}",
+            f"lora={lora_params:,}, depth_head={depth_params:,}, gs_head={gs_params:,}",
         )
 
     def _set_stage1_frame_ids(self):
@@ -88,15 +105,12 @@ class ReconDriveStage1_LITModelModule(ReconDrive_LITModelModule):
         batch_splating_data = self.render_splating_imgs(
             {**batch_recontrast_data, 'ae_global_points': True}, batch_render_data
         )
+        batch_splating_data = self._apply_occ_render_mask(batch_splating_data, batch_input)
 
         loss_gaussian = self.compute_gaussian_loss(batch_splating_data)
-        if hasattr(self, "enable_depth_supervision") and self.enable_depth_supervision:
-            loss_depth = self.compute_depth_loss(batch_splating_data)
-        else:
-            loss_depth = torch.tensor(0.0, device=self.device)
 
         # 新增：计算 Occ 损失（仅在启用时）
-        if getattr(self.model.gs_head, 'enable_occ', False):
+        if getattr(self, 'enable_occ_supervision', False):
             loss_occ = self.compute_occ_loss(batch_recontrast_data, batch_input)
             self.log(f'{stage}/occ', loss_occ.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         else:
@@ -104,9 +118,8 @@ class ReconDriveStage1_LITModelModule(ReconDrive_LITModelModule):
 
         self.log(f'{stage}/gs', loss_gaussian.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log(f'{stage}/norm', loss_norm.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
-        self.log(f'{stage}/depth', loss_depth.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
 
-        loss_all = loss_gaussian + loss_norm + loss_depth + loss_occ
+        loss_all = loss_gaussian + loss_norm + loss_occ
         psnr, ssim, lpips = self.compute_reconstruction_metrics(batch_splating_data, stage)
 
         # Training visualization
@@ -126,59 +139,12 @@ class ReconDriveStage1_LITModelModule(ReconDrive_LITModelModule):
                     batch_recontrast_data,
                 )
 
-                # 新增：如果启用了 Occ 监督，添加 Occ 对比图
-                if getattr(self.model.gs_head, 'enable_occ', False) and 'occ_logits' in batch_recontrast_data:
-                    occ_gt = batch_input.get('context_frames', {}).get('occ_semantics', None)
-                    if occ_gt is not None:
-                        if isinstance(occ_gt, (list, tuple)):
-                            occ_gt = occ_gt[0]
-                        if occ_gt is not None and not isinstance(occ_gt, torch.Tensor):
-                            occ_gt = torch.from_numpy(occ_gt).to(self.device)
-
-                        if occ_gt is not None:
-                            occ_vis_path = os.path.join(
-                                self.save_dir, 'vis',
-                                f'train_occ_step{self.vis_step:06d}.png'
-                            )
-                            os.makedirs(os.path.dirname(occ_vis_path), exist_ok=True)
-                            self.visualize_occ_comparison(
-                                batch_recontrast_data['occ_logits'],
-                                occ_gt,
-                                occ_vis_path
-                            )
-
         del batch_input, batch_recontrast_data, batch_render_data, batch_splating_data
         del psnr, ssim, lpips
 
         self.vis_step += 1
 
         return loss_all
-
-    def on_after_backward(self):
-        if not getattr(self.model.gs_head, 'enable_occ', False):
-            return
-        debug_interval = getattr(self, 'occ_debug_interval', 0)
-        if not debug_interval:
-            return
-        if getattr(self, 'global_step', 0) % debug_interval != 0:
-            return
-        occ_decoder = getattr(self.model.gs_head, 'occ_decoder', None)
-        if occ_decoder is None:
-            return
-        grad_means = []
-        max_abs = 0.0
-        for param in occ_decoder.parameters():
-            if param.grad is None:
-                continue
-            grad = param.grad.detach()
-            grad_means.append(grad.abs().mean())
-            max_abs = max(max_abs, grad.abs().max().item())
-        step = getattr(self, 'global_step', 'n/a')
-        if grad_means:
-            mean_abs = torch.stack(grad_means).mean().item()
-            print(f"[OccGrad] step={step}, mean_abs={mean_abs:.6f}, max_abs={max_abs:.6f}")
-        else:
-            print(f"[OccGrad] step={step}, no_grad")
 
     def validation_step(self, batch_input, batch_idx):
         self.stage = stage = 'val'
@@ -192,6 +158,7 @@ class ReconDriveStage1_LITModelModule(ReconDrive_LITModelModule):
         batch_splating_data = self.render_splating_imgs(
             {**batch_recontrast_data, 'ae_global_points': True}, batch_render_data
         )
+        batch_splating_data = self._apply_occ_render_mask(batch_splating_data, batch_input)
         loss_gaussian = self.compute_gaussian_loss(batch_splating_data)
 
         self.log(f'{stage}/gs', loss_gaussian.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
@@ -235,6 +202,7 @@ class ReconDriveStage1_LITModelModule(ReconDrive_LITModelModule):
         batch_splating_data = self.render_splating_imgs(
             {**batch_recontrast_data, 'ae_global_points': True}, batch_render_data
         )
+        batch_splating_data = self._apply_occ_render_mask(batch_splating_data, batch_input)
         loss_gaussian = self.compute_gaussian_loss(batch_splating_data)
 
         self.log(f'{stage}/gs', loss_gaussian.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
@@ -291,8 +259,26 @@ class ReconDriveStage1_LITModelModule(ReconDrive_LITModelModule):
                 if pred_key not in batch_splating_data or gt_key not in batch_splating_data:
                     return
 
-                gt_imgs.append(batch_splating_data[gt_key][0])
-                stage1_imgs.append(batch_splating_data[pred_key][0])
+                gt_img = batch_splating_data[gt_key][0]
+                pred_img = batch_splating_data[pred_key][0]
+
+                # Use warped_mask (already gated by OCC render mask) so visualization
+                # only keeps visible regions for both GT and rendered images.
+                mask_key = ('warped_mask', frame_id, cam_id)
+                if mask_key in batch_splating_data:
+                    vis_mask = batch_splating_data[mask_key][0]
+                    if vis_mask.dim() == 2:
+                        vis_mask = vis_mask.unsqueeze(0)
+                    if vis_mask.dim() == 3 and vis_mask.shape[0] == 1:
+                        vis_mask = vis_mask.expand_as(gt_img)
+                    elif vis_mask.dim() == 3 and vis_mask.shape[0] != gt_img.shape[0]:
+                        vis_mask = vis_mask[:1].expand_as(gt_img)
+                    vis_mask = vis_mask.to(dtype=gt_img.dtype, device=gt_img.device)
+                else:
+                    vis_mask = torch.ones_like(gt_img)
+
+                gt_imgs.append((gt_img * vis_mask).clamp(0, 1))
+                stage1_imgs.append((pred_img * vis_mask).clamp(0, 1))
 
                 if pred_depths_all is not None:
                     pred_depth_imgs.append(pred_depths_all[cam_id].detach().cpu().float().numpy())
@@ -454,125 +440,104 @@ class ReconDriveStage1_LITModelModule(ReconDrive_LITModelModule):
 
         print("="*80 + "\n")
 
-    def visualize_occ_comparison(self, occ_logits, occ_gt, save_path):
+    def visualize_occ_comparison(self, occ_pred, occ_gt, save_path):
         """
-        本地复现 COME/tools/vis_utils.draw 的可视化风格（不依赖 mayavi），生成与参考实现相似的 3D 占据可视化。
-
-        Args:
-            occ_logits: [B, S, H, W, D, C] 或 [B, H, W, D, C] 预测的 logits
-            occ_gt: [B, H, W, D] 真值标签
-            save_path: 最终合并图片保存路径
+        Visualize surface occupancy (GT vs predicted) without requiring occ_logits.
+        occ_pred: can be one of:
+          - a voxel grid [B, H, W, D] (binary or float)
+          - logits/probabilities [B, H, W, D, C] (will take argmax or threshold)
+          - None (function will return without saving)
+        occ_gt: voxel grid [B, H, W, D]
+        save_path: output image path
         """
         import os
-        import time
         import numpy as np
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
 
-        # 取第一个样本并得到 [H, W, D] 类别格子
-        if occ_logits.dim() == 6:  # [B, S, H, W, D, C]
-            pred = occ_logits[0, 0].argmax(dim=-1).cpu().numpy()
-        else:  # [B, H, W, D, C]
-            pred = occ_logits[0].argmax(dim=-1).cpu().numpy()
-        gt = occ_gt[0].cpu().numpy()  # [H, W, D]
+        if occ_pred is None or occ_gt is None:
+            return
 
-        # vis_utils 中使用的颜色表（已复刻）
-        colors = np.array(
-            [
-                [255, 120,  50, 255],       # barrier              orange
-                [255, 192, 203, 255],       # bicycle              pink
-                [255, 255,   0, 255],       # bus                  yellow
-                [  0, 150, 245, 255],       # car                  blue
-                [  0, 255, 255, 255],       # construction_vehicle cyan
-                [255, 127,   0, 255],       # motorcycle           dark orange
-                [255,   0,   0, 255],       # pedestrian           red
-                [255, 240, 150, 255],       # traffic_cone         light yellow
-                [135,  60,   0, 255],       # trailer              brown
-                [160,  32, 240, 255],       # truck                purple                
-                [255,   0, 255, 255],       # driveable_surface    dark pink
-                [139, 137, 137, 255],
-                [ 75,   0,  75, 255],       # sidewalk             dard purple
-                [150, 240,  80, 255],       # terrain              light green          
-                [230, 230, 250, 255],       # manmade              white
-                [  0, 175,   0, 255],       # vegetation           green
-            ]
-        ).astype(np.uint8)
-        # normalize colors to [0,1]
-        cmap_rgba = (colors[:, :3].astype(np.float32) / 255.0)
+        # normalize inputs to numpy [H, W, D]
+        if isinstance(occ_pred, (list, tuple)):
+            occ_pred = occ_pred[0] if len(occ_pred) > 0 else None
+        if occ_pred is None:
+            return
+        if hasattr(occ_pred, 'cpu'):
+            occ_pred = occ_pred.detach().cpu().numpy()
+        if hasattr(occ_gt, 'cpu'):
+            occ_gt_np = occ_gt.detach().cpu().numpy()
+        else:
+            occ_gt_np = np.array(occ_gt)
 
-        # parameters matching vis_utils
+        # If occ_pred has channels, reduce to single-class occupancy
+        if occ_pred.ndim == 5:  # [B, H, W, D, C]
+            try:
+                pred_grid = occ_pred[0].argmax(axis=-1)
+            except Exception:
+                pred_grid = (occ_pred[0].max(axis=-1) > 0.5).astype(np.uint8)
+        elif occ_pred.ndim == 4:  # [B, H, W, D] or [H,W,D]
+            pred_grid = occ_pred[0] if occ_pred.shape[0] > 1 else occ_pred.squeeze(0)
+        else:
+            # fallback: try to squeeze
+            pred_grid = np.squeeze(occ_pred)
+
+        if pred_grid.ndim != 3:
+            pred_grid = pred_grid.reshape(pred_grid.shape[-3:])
+
+        gt = occ_gt_np[0] if occ_gt_np.shape[0] > 1 else occ_gt_np.squeeze(0)
+
+        # Compute voxel centers in world coordinates
         vox_origin = np.array([-40.0, -40.0, -1.0], dtype=np.float32)
         voxel_size = float(0.4)
 
-        def get_grid_coords(dims, resolution):
-            g_xx = np.arange(0, dims[0])
-            g_yy = np.arange(0, dims[1])
-            g_zz = np.arange(0, dims[2])
-            xx, yy, zz = np.meshgrid(g_xx, g_yy, g_zz)
-            coords_grid = np.array([xx.flatten(), yy.flatten(), zz.flatten()]).T.astype(np.float32)
-            resolution = np.array([resolution, resolution, resolution], dtype=np.float32).reshape([1, 3])
-            coords_grid = (coords_grid * resolution) + resolution / 2.0
-            return coords_grid
+        H, W, D = pred_grid.shape
+        gx = np.arange(0, H)
+        gy = np.arange(0, W)
+        gz = np.arange(0, D)
+        xx, yy, zz = np.meshgrid(gx, gy, gz)
+        grid_coords = np.array([xx.flatten(), yy.flatten(), zz.flatten()]).T.astype(np.float32)
+        grid_coords = (grid_coords * voxel_size) + vox_origin.reshape([1, 3])
 
-        # vis_utils 使用 voxels.shape -> w,h,z
-        # 我们的 pred/gt 是 [H, W, D]，直接用其形状
-        H, W, D = pred.shape
-        # compute voxel centers in world coords
-        grid_coords = get_grid_coords([H, W, D], voxel_size) + vox_origin.reshape([1, 3])  # (N,3)
-
-        # flatten labels consistent with grid_coords ordering
-        labels_pred = pred.flatten()
+        labels_pred = pred_grid.flatten()
         labels_gt = gt.flatten()
 
-        # Optionally insert ego car markers like vis_utils.show_ego
-        try:
-            show_ego = True
-            if show_ego and pred.shape == (200, 200, 16):
-                pred = pred.copy()
-                pred[96:104, 96:104, 2:7] = 15
-                pred[104:106, 96:104, 2:5] = 3
-                labels_pred = pred.flatten()
-            if show_ego and gt.shape == (200, 200, 16):
-                gt = gt.copy()
-                gt[96:104, 96:104, 2:7] = 15
-                gt[104:106, 96:104, 2:5] = 3
-                labels_gt = gt.flatten()
-        except Exception:
-            pass
-
-        # select voxels inside [1,16] like vis_utils: (v>0) & (v<17)
-        mask_pred = (labels_pred > 0) & (labels_pred < 17)
-        mask_gt = (labels_gt > 0) & (labels_gt < 17)
+        mask_pred = labels_pred > 0
+        mask_gt = labels_gt > 0
 
         coords_pred = grid_coords[mask_pred]
         coords_gt = grid_coords[mask_gt]
-        labels_pred_sel = labels_pred[mask_pred].astype(np.int32) - 1  # 0-based index
-        labels_gt_sel = labels_gt[mask_gt].astype(np.int32) - 1
 
-        # limit points
         max_points = 100000
         if coords_pred.shape[0] > max_points:
             idx = np.random.choice(coords_pred.shape[0], max_points, replace=False)
             coords_pred = coords_pred[idx]
-            labels_pred_sel = labels_pred_sel[idx]
         if coords_gt.shape[0] > max_points:
             idx = np.random.choice(coords_gt.shape[0], max_points, replace=False)
             coords_gt = coords_gt[idx]
-            labels_gt_sel = labels_gt_sel[idx]
 
-        # map labels to colors
-        def map_colors(label_inds):
-            if label_inds.size == 0:
-                return np.zeros((0, 4))
-            cols = cmap_rgba[label_inds % cmap_rgba.shape[0]]
-            return cols
+        fig = plt.figure(figsize=(12, 6), dpi=120)
+        ax1 = fig.add_subplot(121, projection='3d')
+        ax2 = fig.add_subplot(122, projection='3d')
 
-        cols_pred = map_colors(labels_pred_sel)
-        cols_gt = map_colors(labels_gt_sel)
+        if coords_pred.shape[0] > 0:
+            ax1.scatter(coords_pred[:, 0], coords_pred[:, 1], coords_pred[:, 2], c='red', s=0.5)
+        if coords_gt.shape[0] > 0:
+            ax2.scatter(coords_gt[:, 0], coords_gt[:, 1], coords_gt[:, 2], c='green', s=0.5)
 
-        # create figure with white background and two 3D subplots
-        fig = plt.figure(figsize=(14, 6), dpi=120)
+        ax1.set_title('Predicted surface occ')
+        ax2.set_title('Ground-truth surface occ')
+
+        for ax in (ax1, ax2):
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_zticks([])
+
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        fig.savefig(save_path, bbox_inches='tight')
+        plt.close(fig)
+
         ax1 = fig.add_subplot(121, projection='3d', facecolor='white')
         ax2 = fig.add_subplot(122, projection='3d', facecolor='white')
 

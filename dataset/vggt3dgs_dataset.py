@@ -145,10 +145,19 @@ class NuScenesdataset3D(NuScenesdataset4D):
             if os.path.exists(occ_file):
                 try:
                     occ_data = np.load(occ_file)
+                    occ_semantics = occ_data['semantics']
+                    occ_mask_camera = occ_data.get('mask_camera', None)
+                    occ_mask_lidar = occ_data.get('mask_lidar', None)
+                    visible_mask = occ_mask_lidar if occ_mask_lidar is not None else occ_mask_camera
+                    surface_occ = None
+                    if visible_mask is not None:
+                        surface_occ = (occ_semantics > 0) & (visible_mask > 0)
                     data.update({
-                        'occ_semantics': occ_data['semantics'],  # [200,200,16] uint8
-                        'occ_mask_camera': occ_data.get('mask_camera', None),
-                        'occ_mask_lidar': occ_data.get('mask_lidar', None),
+                        'occ_semantics': occ_semantics,  # [200,200,16] uint8
+                        'occ_mask_camera': occ_mask_camera,
+                        'occ_mask_lidar': occ_mask_lidar,
+                        'occ_surface': surface_occ.astype(np.uint8) if surface_occ is not None else None,
+                        'occ_visible_mask': visible_mask,
                     })
                 except Exception as e:
                     print(f"警告: 加载 Occ 数据失败 {occ_file}: {e}")
@@ -156,6 +165,8 @@ class NuScenesdataset3D(NuScenesdataset4D):
                         'occ_semantics': None,
                         'occ_mask_camera': None,
                         'occ_mask_lidar': None,
+                        'occ_surface': None,
+                        'occ_visible_mask': None,
                     })
             else:
                 # 如果文件不存在，设置为 None
@@ -163,6 +174,8 @@ class NuScenesdataset3D(NuScenesdataset4D):
                     'occ_semantics': None,
                     'occ_mask_camera': None,
                     'occ_mask_lidar': None,
+                    'occ_surface': None,
+                    'occ_visible_mask': None,
                 })
 
         return data

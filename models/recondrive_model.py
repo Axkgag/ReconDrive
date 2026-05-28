@@ -577,7 +577,6 @@ class ReconDriveVoxelModel(torch.nn.Module):
         voxel_z_range=(-1.0, 5.4),
         voxel_feature_dim: int = 256,
         gaussians_per_voxel: int = 1,
-        enable_occ: bool = False,
     ):
         super().__init__()
         self.img_size = 518
@@ -621,7 +620,6 @@ class ReconDriveVoxelModel(torch.nn.Module):
             x_range=tuple(voxel_x_range),
             y_range=tuple(voxel_y_range),
             z_range=tuple(voxel_z_range),
-            enable_occ=enable_occ,
         )
 
         self.track_head = None
@@ -644,27 +642,14 @@ class ReconDriveVoxelModel(torch.nn.Module):
             depth_range = self.max_depth - self.min_depth
             depth_maps = self.min_depth + depth_range * depth_maps
 
-            # 根据是否启用 Occ 决定调用方式
-            if self.gs_head.enable_occ:
-                raw_gaussian, occ_logits = self.gs_head(
-                    aggregated_tokens_list,
-                    images=images,
-                    patch_start_idx=patch_start_idx,
-                    depth_maps=depth_maps,
-                    intrinsics=intrinsics,
-                    extrinsics=extrinsics,
-                    return_occ_logits=True,
-                )
-            else:
-                raw_gaussian = self.gs_head(
-                    aggregated_tokens_list,
-                    images=images,
-                    patch_start_idx=patch_start_idx,
-                    depth_maps=depth_maps,
-                    intrinsics=intrinsics,
-                    extrinsics=extrinsics,
-                )
-                occ_logits = None
+            raw_gaussian = self.gs_head(
+                aggregated_tokens_list,
+                images=images,
+                patch_start_idx=patch_start_idx,
+                depth_maps=depth_maps,
+                intrinsics=intrinsics,
+                extrinsics=extrinsics,
+            )
 
             offset_maps, rot_maps, scale_maps, opacity_maps, sh_maps = raw_gaussian.split(
                 (3, 4, 3, 1, 3 * self.d_sh), dim=-1
@@ -701,8 +686,6 @@ class ReconDriveVoxelModel(torch.nn.Module):
             "forward_flow": forward_flow,
             "offset_maps": offset_maps,
         }
-        if occ_logits is not None:
-            ret_dict["occ_logits"] = occ_logits
         return ret_dict
 
 
@@ -732,7 +715,6 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                 voxel_z_range=getattr(self, 'voxel_z_range', [-1.0, 5.4]),
                 voxel_feature_dim=getattr(self, 'voxel_feature_dim', 256),
                 gaussians_per_voxel=getattr(self, 'voxel_gaussians_per_voxel', 1),
-                enable_occ=getattr(self, 'enable_occ_supervision', False),
             )
         else:
             self.model = ReconDriveModel(
@@ -741,7 +723,8 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                 max_depth=self.max_depth,
                 vggt_checkpoint=vggt_checkpoint,
             )
-        self.lpips = LPIPS(net="vgg", pretrained=False, model_path='/data_map/liangyihao/ReconDrive/checkpoints/lpips_vgg.pth')
+        self._configure_depth_head_trainable()
+        self.lpips = LPIPS(net="vgg", pretrained=True)
         self.ssim_fn = SSIMLoss(window_size=11,reduction='none')
         self.l1_fn = torch.nn.L1Loss(reduction='none')
         self.lpips.eval()
@@ -758,9 +741,20 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
         self.camera_names = ['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 
                             'CAM_BACK_LEFT', 'CAM_BACK_RIGHT', 'CAM_BACK']
+
+    def _configure_depth_head_trainable(self):
+        depth_head = getattr(self.model, 'depth_head', None)
+        if depth_head is None:
+            return
+        for param in depth_head.parameters():
+            param.requires_grad = False
+        if hasattr(depth_head, 'scratch') and hasattr(depth_head.scratch, 'output_conv2'):
+            for param in depth_head.scratch.output_conv2.parameters():
+                param.requires_grad = True
         
         # Performance optimization flags
-        self.compute_alternative_flow = cfg.get('model_cfg', {}).get('compute_alternative_flow', False)  # Mode 2 flow for comparison
+        model_cfg = getattr(self, 'model_cfg', {}) or {}
+        self.compute_alternative_flow = model_cfg.get('compute_alternative_flow', False)  # Mode 2 flow for comparison
     
     def load_pretrained_checkpoint(self, checkpoint_path, strict=False, verbose=True):
        
@@ -977,9 +971,9 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
         batch_render_data = self.get_render_data(batch_input)
         batch_splating_data  = self.render_splating_imgs(batch_recontrast_data,batch_render_data)
+        batch_splating_data = self._apply_occ_render_mask(batch_splating_data, batch_input)
 
         loss_gaussian = self.compute_gaussian_loss(batch_splating_data)
-        loss_depth = torch.tensor(0.0, device=self.device)
 
         batch_render_project_data = self.render_project_imgs(batch_input, batch_recontrast_data)
         loss_project = self.compute_project_loss(batch_render_project_data)
@@ -990,7 +984,7 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         self.log(f'{stage}/norm', loss_norm.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
 
         # Exclude projection loss from total loss
-        loss_all = loss_gaussian + loss_depth + loss_project + loss_norm
+        loss_all = loss_gaussian + loss_project + loss_norm
         psnr, ssim, lpips = self.compute_reconstruction_metrics(batch_splating_data,stage)
 
         del batch_input, batch_recontrast_data, batch_render_data, batch_render_project_data, batch_splating_data, psnr, ssim, lpips
@@ -1055,17 +1049,16 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         loss_project = self.compute_project_loss(batch_render_project_data)
 
         batch_splating_data  = self.render_splating_imgs(batch_recontrast_data,batch_render_data)
+        batch_splating_data = self._apply_occ_render_mask(batch_splating_data, batch_input)
 
-        loss_depth = self.compute_depth_loss(batch_splating_data)
         loss_gaussian = self.compute_gaussian_loss(batch_splating_data)
 
         self.log(f'{stage}/gs', loss_gaussian.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log(f'{stage}/proj', loss_project.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log(f'{stage}/depth', loss_depth.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log(f'{stage}/norm', loss_norm.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
 
         # Exclude projection loss from total loss
-        loss_all = loss_gaussian + loss_depth + loss_norm + loss_project
+        loss_all = loss_gaussian + loss_norm + loss_project
         psnr, ssim, lpips = self.compute_reconstruction_metrics(batch_splating_data,stage)
 
         del batch_input,batch_recontrast_data, batch_render_data, batch_render_project_data, batch_splating_data, psnr, ssim, lpips
@@ -1091,16 +1084,15 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         loss_project = self.compute_project_loss(batch_render_project_data)
 
         batch_splating_data  = self.render_splating_imgs(batch_recontrast_data,batch_render_data)
+        batch_splating_data = self._apply_occ_render_mask(batch_splating_data, batch_input)
 
-        loss_depth = self.compute_depth_loss(batch_recontrast_data)
         loss_gaussian = self.compute_gaussian_loss(batch_splating_data)
 
         self.log(f'{stage}/gs', loss_gaussian.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log(f'{stage}/proj', loss_project.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log(f'{stage}/depth', loss_depth.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log(f'{stage}/norm', loss_norm.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
 
-        loss_all = loss_gaussian + loss_depth + loss_norm + loss_project
+        loss_all = loss_gaussian + loss_norm + loss_project
         psnr, ssim, lpips = self.compute_reconstruction_metrics(batch_splating_data,stage)
 
         del batch_input,batch_recontrast_data, batch_render_data, batch_render_project_data, batch_splating_data, psnr, ssim, lpips
@@ -1535,10 +1527,8 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             sh_maps = model_out['sh_maps']
             forward_flow = model_out['forward_flow']
             offset_maps = model_out.get('offset_maps', None)
-            occ_logits = model_out.get('occ_logits', None)
         else:
             depth_maps, rot_maps, scale_maps, opacity_maps, sh_maps, forward_flow = model_out
-            occ_logits = None
             offset_maps = None
         if self.enable_nan_checks:
             self._check_finite(depth_maps, "depth_maps")
@@ -1548,7 +1538,6 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             self._check_finite(sh_maps, "sh_maps")
             self._check_finite(forward_flow, "forward_flow")
             self._check_finite(offset_maps, "offset_maps")
-            self._check_finite(occ_logits, "occ_logits")
         del image_list
         batch_size = depth_maps.shape[0]
         frame_camrea = depth_maps.shape[1]
@@ -1878,10 +1867,6 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             outputs['xyz_transformed'] = outputs['xyz']
             outputs['rot_maps_transformed'] = outputs['rot_maps']
             outputs['sh_maps_transformed'] = outputs['sh_maps']
-
-        # Add occ_logits to outputs if available
-        if occ_logits is not None:
-            outputs['occ_logits'] = occ_logits
 
         del bfc_K, bfc_c2e, bfc_depth_maps, bfc_xyz, rot_maps, scale_maps, opacity_maps, bfc_sh,
         return outputs
@@ -2663,110 +2648,110 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
         return total_reg_loss
 
+    def _apply_occ_render_mask(self, batch_splating_data, batch_input):
+        occ_masks = batch_input.get('context_frames', {}).get('occ_render_mask', None)
+        if occ_masks is None:
+            return batch_splating_data
+        if isinstance(occ_masks, (list, tuple)):
+            occ_masks = occ_masks[0] if len(occ_masks) > 0 else None
+        if occ_masks is None:
+            return batch_splating_data
+        if not torch.is_tensor(occ_masks):
+            occ_masks = torch.from_numpy(occ_masks)
+
+        occ_masks = occ_masks.to(device=self.device)
+        if occ_masks.dim() == 3:
+            occ_masks = occ_masks.unsqueeze(0)
+        for frame_id in self.all_render_frame_ids:
+            for cam_id in range(self.num_cams):
+                mask_key = ('warped_mask', frame_id, cam_id)
+                if mask_key not in batch_splating_data:
+                    continue
+                mask = batch_splating_data[mask_key]
+                frame_cam_idx = frame_id * self.num_cams + cam_id
+                if frame_cam_idx >= occ_masks.shape[1]:
+                    continue
+                occ_mask = occ_masks[:, frame_cam_idx]
+                if occ_mask.dim() == 4 and occ_mask.shape[1] == 1:
+                    occ_mask = occ_mask[:, 0]
+                if occ_mask.shape[-2:] != mask.shape[-2:]:
+                    occ_mask = torch.nn.functional.interpolate(
+                        occ_mask.unsqueeze(1).float(),
+                        size=mask.shape[-2:],
+                        mode='nearest',
+                    ).squeeze(1)
+                # Ensure mask shape is [B, 1, H, W] to avoid accidental broadcasting
+                # from [B, H, W] -> [B, B, H, W] when multiplied with warped_mask.
+                occ_mask = (occ_mask > 0.5).to(dtype=mask.dtype, device=mask.device)
+                if occ_mask.dim() == 3:
+                    occ_mask = occ_mask.unsqueeze(1)
+                batch_splating_data[mask_key] = (mask * occ_mask).detach()
+
+        return batch_splating_data
+
     def compute_occ_loss(self, batch_recontrast_data, batch_input):
-        """计算 Occupancy 预测损失"""
-        if 'occ_logits' not in batch_recontrast_data:
+        """Geometry OCC loss on Gaussian centers (direct xyz supervision)."""
+        surface_occ = batch_input.get('context_frames', {}).get('occ_surface', None)
+        visible_mask = batch_input.get('context_frames', {}).get('occ_visible_mask', None)
+        if surface_occ is None or visible_mask is None:
             return torch.tensor(0.0, device=self.device)
 
-        occ_logits = batch_recontrast_data['occ_logits']  # [B, S, 200, 200, 16, 18]
+        if isinstance(surface_occ, (list, tuple)):
+            surface_occ = surface_occ[0] if len(surface_occ) > 0 else None
+        if isinstance(visible_mask, (list, tuple)):
+            visible_mask = visible_mask[0] if len(visible_mask) > 0 else None
+        if surface_occ is None or visible_mask is None:
+            return torch.tensor(0.0, device=self.device)
+
+        if not torch.is_tensor(surface_occ):
+            surface_occ = torch.from_numpy(surface_occ)
+        if not torch.is_tensor(visible_mask):
+            visible_mask = torch.from_numpy(visible_mask)
+
+        surface_occ = surface_occ.to(device=self.device, dtype=torch.float32)
+        visible_mask = visible_mask.to(device=self.device, dtype=torch.float32)
+
+        if surface_occ.dim() == 3:
+            surface_occ = surface_occ.unsqueeze(0)
+        if visible_mask.dim() == 3:
+            visible_mask = visible_mask.unsqueeze(0)
+
+        xyz = batch_recontrast_data.get('xyz', None)
+        if xyz is None:
+            return torch.tensor(0.0, device=self.device)
+
+        b, n, _ = xyz.shape
+        x0, x1 = getattr(self, 'voxel_x_range', (-40.0, 40.0))
+        y0, y1 = getattr(self, 'voxel_y_range', (-40.0, 40.0))
+        z0, z1 = getattr(self, 'voxel_z_range', (-1.0, 5.4))
+        eps = 1e-6
+
+        grid_x = 2.0 * (xyz[..., 0] - x0) / (x1 - x0 + eps) - 1.0
+        grid_y = 2.0 * (xyz[..., 1] - y0) / (y1 - y0 + eps) - 1.0
+        grid_z = 2.0 * (xyz[..., 2] - z0) / (z1 - z0 + eps) - 1.0
+        grid = torch.stack([grid_x, grid_y, grid_z], dim=-1).view(b, n, 1, 1, 3)
+
+        occ_vol = surface_occ.permute(0, 3, 2, 1).unsqueeze(1)
+        vis_vol = visible_mask.permute(0, 3, 2, 1).unsqueeze(1)
+
+        occ_samples = torch.nn.functional.grid_sample(
+            occ_vol, grid, mode='bilinear', padding_mode='zeros', align_corners=True
+        ).view(b, n)
+        vis_samples = torch.nn.functional.grid_sample(
+            vis_vol, grid, mode='bilinear', padding_mode='zeros', align_corners=True
+        ).view(b, n)
+
+        # Geometry constraint: points should lie in occupied surface within visible area.
+        # Use soft visible weighting to keep gradients smoother than hard threshold gating.
+        vis_weights = vis_samples.clamp(0.0, 1.0)
+        valid = vis_weights > 1e-3
+        if not valid.any():
+            return torch.tensor(0.0, device=self.device)
+
+        geom_error = (1.0 - occ_samples).clamp(0.0, 1.0)
+        loss = (geom_error * vis_weights).sum() / (vis_weights.sum() + 1e-6)
         if self.enable_nan_checks:
-            self._check_finite(occ_logits, "occ_logits")
-
-        # 获取真值
-        occ_gt = batch_input.get('context_frames', {}).get('occ_semantics', None)
-        if occ_gt is None:
-            return torch.tensor(0.0, device=self.device)
-
-        # 处理列表/元组格式
-        if isinstance(occ_gt, (list, tuple)):
-            occ_gt = occ_gt[0] if len(occ_gt) > 0 else None
-        if occ_gt is None:
-            return torch.tensor(0.0, device=self.device)
-
-        # 转换为 tensor 并 reshape
-        if not isinstance(occ_gt, torch.Tensor):
-            occ_gt = torch.from_numpy(occ_gt).to(self.device)
-        occ_gt = occ_gt.long()  # [B, 200, 200, 16]
-        if self.enable_nan_checks:
-            self._check_finite(occ_gt, "occ_gt")
-
-        # 取第一帧（Stage 1 只有单帧）
-        if occ_logits.dim() == 6:  # [B, S, 200, 200, 16, 18]
-            occ_logits = occ_logits[:, 0]  # [B, 200, 200, 16, 18]
-
-        # 可观测区域掩码：优先使用 occ_mask_lidar/occ_mask_camera，否则退化为有效 voxel
-        occ_mask = batch_input.get('context_frames', {}).get('occ_mask_lidar', None)
-        mask_source = 'occ_mask_lidar'
-        if occ_mask is None:
-            occ_mask = batch_input.get('context_frames', {}).get('occ_mask_camera', None)
-            mask_source = 'occ_mask_camera'
-        if isinstance(occ_mask, (list, tuple)):
-            occ_mask = occ_mask[0] if len(occ_mask) > 0 else None
-        if occ_mask is not None and not isinstance(occ_mask, torch.Tensor):
-            occ_mask = torch.from_numpy(occ_mask).to(self.device)
-        if occ_mask is not None:
-            if occ_mask.dim() == 3:
-                occ_mask = occ_mask.unsqueeze(0)
-            if occ_mask.dim() == 5 and occ_mask.shape[1] == 1:
-                occ_mask = occ_mask[:, 0]
-            if occ_mask.shape[0] == 1 and occ_gt.shape[0] > 1:
-                occ_mask = occ_mask.expand(occ_gt.shape[0], -1, -1, -1)
-            if occ_mask.shape != occ_gt.shape:
-                print(
-                    f"[OccMask] shape mismatch: occ_mask={tuple(occ_mask.shape)}, "
-                    f"occ_gt={tuple(occ_gt.shape)}. Falling back to logits mask."
-                )
-                occ_mask = None
-        if occ_mask is None:
-            mask_source = 'logits_nonzero'
-            occ_mask = (occ_logits.abs().sum(dim=-1) > 0)
-        else:
-            occ_mask = occ_mask.to(dtype=torch.bool, device=self.device)
-
-        # 只在可观测且非 unknown 的 voxel 上计算损失
-        mask_final = occ_mask & (occ_gt != 0)
-
-        debug_interval = getattr(self, 'occ_debug_interval', 0)
-        if debug_interval and getattr(self, 'global_step', 0) % debug_interval == 0:
-            with torch.no_grad():
-                occ_logits_debug = occ_logits
-                occ_pred = occ_logits_debug.argmax(dim=-1)
-                pred_flat = occ_pred.reshape(-1).detach().cpu()
-                gt_flat = occ_gt.reshape(-1).detach().cpu()
-                pred_nonempty = int(((pred_flat > 0) & (pred_flat < 17)).sum().item())
-                gt_nonempty = int(((gt_flat > 0) & (gt_flat < 17)).sum().item())
-                voxel_nonzero = int((occ_logits_debug.abs().sum(dim=-1) > 0).sum().item())
-                voxel_total = occ_logits_debug[..., 0].numel()
-                mask_obs = int(occ_mask.sum().item())
-                mask_final_cnt = int(mask_final.sum().item())
-                logits_min = occ_logits_debug.min().item()
-                logits_max = occ_logits_debug.max().item()
-                logits_mean = occ_logits_debug.mean().item()
-                stage = getattr(self, 'stage', 'unknown')
-                step = getattr(self, 'global_step', 'n/a')
-                print(
-                    f"[OccDebug] step={step}, stage={stage}, logits_shape={tuple(occ_logits_debug.shape)}, "
-                    f"gt_shape={tuple(occ_gt.shape)}, logits_min={logits_min:.4f}, "
-                    f"logits_max={logits_max:.4f}, logits_mean={logits_mean:.4f}, "
-                    f"voxel_nonzero={voxel_nonzero}, voxel_total={voxel_total}, "
-                    f"mask_source={mask_source}, mask_obs={mask_obs}, mask_final={mask_final_cnt}, "
-                    f"pred_nonempty={pred_nonempty}, gt_nonempty={gt_nonempty}"
-                )
-
-        if not mask_final.any():
-            return torch.tensor(0.0, device=self.device)
-
-        # Reshape 用于交叉熵
-        logits_flat = occ_logits.reshape(-1, 18)
-        gt_flat = occ_gt.reshape(-1)
-        mask_flat = mask_final.reshape(-1)
-
-        # 计算交叉熵（忽略类别 0 = 空/未知）
-        loss = torch.nn.functional.cross_entropy(
-            logits_flat[mask_flat], gt_flat[mask_flat], ignore_index=0, reduction='mean'
-        )
-        if self.enable_nan_checks:
-            self._check_finite(loss, "occ_loss")
+            self._check_finite(loss, "occ_geometry_loss")
 
         return self.lambda_occ * loss
 

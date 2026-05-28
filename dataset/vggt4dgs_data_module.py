@@ -124,6 +124,12 @@ class VGGT4DGS_LITDataModule(pl.LightningDataModule):
         else:
             jittering_prob = 0.0
 
+        occ_mask_dir = getattr(self, 'occ_mask_dir', None)
+        if mode == 'train' and hasattr(self, 'occ_mask_dir_train'):
+            occ_mask_dir = self.occ_mask_dir_train
+        elif mode in ['val', 'test'] and hasattr(self, 'occ_mask_dir_val'):
+            occ_mask_dir = self.occ_mask_dir_val
+
         dataset_args = {
             'cameras': self.cameras,
             'back_context': self.back_context,
@@ -145,6 +151,7 @@ class VGGT4DGS_LITDataModule(pl.LightningDataModule):
             'enable_occ_supervision': getattr(self, 'enable_occ_supervision', False),
             'occ_data_path': getattr(self, 'occ_data_path', None),
             'filter_missing_occ': getattr(self, 'filter_missing_occ', False),
+            'occ_mask_dir': occ_mask_dir,
         }
         stage_dict = {
             'train':'train',
@@ -219,5 +226,4 @@ if __name__ == '__main__':
         rgb = inputs[('color_org', 0)][cam_id]
         rgb = rgb.cpu().numpy().transpose(1, 2, 0).clip(0, 1) * 255
         pil.fromarray(rgb.astype(np.uint8)).save('rgb_org_%d.png' % cam_id)
-
 

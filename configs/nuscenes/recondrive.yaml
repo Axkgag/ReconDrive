@@ -67,6 +67,8 @@ data_cfg:
   # gt_ego_pose, gt_depth is not used during training, only for visulization
   train_requirements: (gt_pose, gt_ego_pose, gt_depth, mask)
   val_requirements: (gt_pose, gt_ego_pose, gt_depth, mask)
+  occ_mask_dir_train: './data/nuscenes/occ_masks_train_rasterization'
+  occ_mask_dir_val: './data/nuscenes/occ_masks_val_rasterization'
   
   batch_size: 2
   data_shuffle: True

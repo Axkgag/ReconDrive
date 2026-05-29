@@ -974,6 +974,7 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         batch_splating_data = self._apply_occ_render_mask(batch_splating_data, batch_input)
 
         loss_gaussian = self.compute_gaussian_loss(batch_splating_data)
+        loss_depth = self._maybe_compute_depth_loss(batch_splating_data)
 
         batch_render_project_data = self.render_project_imgs(batch_input, batch_recontrast_data)
         loss_project = self.compute_project_loss(batch_render_project_data)
@@ -982,9 +983,13 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         self.log(f'{stage}/gs', loss_gaussian.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log(f'{stage}/proj', loss_project.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log(f'{stage}/norm', loss_norm.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        if loss_depth is not None:
+            self.log(f'{stage}/depth', loss_depth.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
 
         # Exclude projection loss from total loss
         loss_all = loss_gaussian + loss_project + loss_norm
+        if loss_depth is not None:
+            loss_all = loss_all + loss_depth
         psnr, ssim, lpips = self.compute_reconstruction_metrics(batch_splating_data,stage)
 
         del batch_input, batch_recontrast_data, batch_render_data, batch_render_project_data, batch_splating_data, psnr, ssim, lpips
@@ -1052,13 +1057,18 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         batch_splating_data = self._apply_occ_render_mask(batch_splating_data, batch_input)
 
         loss_gaussian = self.compute_gaussian_loss(batch_splating_data)
+        loss_depth = self._maybe_compute_depth_loss(batch_splating_data)
 
         self.log(f'{stage}/gs', loss_gaussian.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log(f'{stage}/proj', loss_project.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log(f'{stage}/norm', loss_norm.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        if loss_depth is not None:
+            self.log(f'{stage}/depth', loss_depth.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
 
         # Exclude projection loss from total loss
         loss_all = loss_gaussian + loss_norm + loss_project
+        if loss_depth is not None:
+            loss_all = loss_all + loss_depth
         psnr, ssim, lpips = self.compute_reconstruction_metrics(batch_splating_data,stage)
 
         del batch_input,batch_recontrast_data, batch_render_data, batch_render_project_data, batch_splating_data, psnr, ssim, lpips
@@ -1087,12 +1097,17 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         batch_splating_data = self._apply_occ_render_mask(batch_splating_data, batch_input)
 
         loss_gaussian = self.compute_gaussian_loss(batch_splating_data)
+        loss_depth = self._maybe_compute_depth_loss(batch_splating_data)
 
         self.log(f'{stage}/gs', loss_gaussian.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log(f'{stage}/proj', loss_project.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log(f'{stage}/norm', loss_norm.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        if loss_depth is not None:
+            self.log(f'{stage}/depth', loss_depth.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
 
         loss_all = loss_gaussian + loss_norm + loss_project
+        if loss_depth is not None:
+            loss_all = loss_all + loss_depth
         psnr, ssim, lpips = self.compute_reconstruction_metrics(batch_splating_data,stage)
 
         del batch_input,batch_recontrast_data, batch_render_data, batch_render_project_data, batch_splating_data, psnr, ssim, lpips
@@ -1587,6 +1602,8 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             bfc_rot_maps = rearrange(rot_maps, 'b c h w d -> (b c) (h w) d', d=4)
 
         outputs['pred_depths'] = rearrange(bfc_depth_maps, '(b c) h w -> b (c h w)', b=batch_size, c=frame_camrea)#.contiguous()
+        # Keep depth-head prediction in map format for direct dense depth supervision.
+        outputs['pred_depth_maps'] = depth_maps.squeeze(-1)
 
         outputs['xyz'] = rearrange(bfc_xyz, '(b c) p k -> b (c p) k', b=batch_size, c=frame_camrea)#.contiguous()
         outputs['rot_maps'] = rearrange(bfc_rot_maps, '(b c) p d -> b (c p) d', b=batch_size, c=frame_camrea, d=4)#.contiguous()
@@ -2597,7 +2614,7 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
     def compute_depth_loss(self, batch_recontrast_data, beta=1.0, eps=1e-6):
         """
-        This function computes edge-aware smoothness loss for the disparity map.
+        This function computes supervised depth regression plus edge-aware smoothness.
         """
         depth_loss = 0.0 
         count = 0
@@ -2612,12 +2629,17 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                     self._check_finite(pred_depth, f"projected_depths[{frame_id},{cam_id}]")
                     self._check_finite(gaussian_color, f"gaussian_color[{frame_id},{cam_id}]")
 
-                mask_depth = torch.logical_and(gt_depth > self.min_depth, gt_depth < self.max_depth)
+                mask_depth = torch.isfinite(gt_depth)
+                mask_depth = torch.logical_and(mask_depth, gt_depth > self.min_depth)
+                mask_depth = torch.logical_and(mask_depth, gt_depth < self.max_depth)
                 mask_depth = mask_depth.to(torch.float32)
+                valid_depth_count = torch.sum(mask_depth)
+                if valid_depth_count.item() == 0:
+                    continue
 
                 abs_diff = torch.abs(gt_depth - pred_depth) * mask_depth
                 l1loss = torch.where(abs_diff < beta, 0.5 * abs_diff * abs_diff / beta, abs_diff - 0.5 * beta)
-                l1loss = torch.sum(l1loss) / (torch.sum(mask_depth) + eps)
+                l1loss = torch.sum(l1loss) / (valid_depth_count + eps)
                 if self.enable_nan_checks:
                     self._check_finite(l1loss, f"depth_l1loss[{frame_id},{cam_id}]")
                 depth_loss += l1loss * self.lambda_depth
@@ -2634,7 +2656,68 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
                 count += 1
 
-        return   depth_loss / count
+        if count == 0:
+            return torch.zeros((), device=gt_depth.device, dtype=gt_depth.dtype)
+
+        return depth_loss / count
+
+    def _maybe_compute_depth_loss(self, batch_splating_data):
+        if not getattr(self, 'enable_depth_supervision', False):
+            return None
+        return self.compute_depth_loss(batch_splating_data)
+
+    def compute_depth_head_loss(self, batch_recontrast_data, batch_input, beta=1.0, eps=1e-6):
+        """Directly supervise depth-head output with dense depth GT."""
+        pred_depth = batch_recontrast_data.get('pred_depth_maps', None)
+        if pred_depth is None:
+            return None
+
+        context_frames = batch_input.get('context_frames', {})
+        gt_depth = context_frames.get('gt_depth', None)
+        if gt_depth is None:
+            return None
+
+        if gt_depth.dim() == 5 and gt_depth.shape[2] == 1:
+            gt_depth = gt_depth.squeeze(2)  # [B, C, 1, H, W] -> [B, C, H, W]
+        elif gt_depth.dim() == 5 and gt_depth.shape[-1] == 1:
+            gt_depth = gt_depth.squeeze(-1)  # [B, C, H, W, 1] -> [B, C, H, W]
+        elif gt_depth.dim() == 3:
+            gt_depth = gt_depth.unsqueeze(1)  # [B, H, W] -> [B, 1, H, W]
+
+        if gt_depth.dim() != 4:
+            return None
+
+        if gt_depth.shape[1] != pred_depth.shape[1]:
+            valid_views = min(gt_depth.shape[1], pred_depth.shape[1])
+            gt_depth = gt_depth[:, :valid_views]
+            pred_depth = pred_depth[:, :valid_views]
+
+        if gt_depth.shape[-2:] != pred_depth.shape[-2:]:
+            b, c, _, _ = gt_depth.shape
+            gt_depth = F.interpolate(
+                gt_depth.reshape(b * c, 1, gt_depth.shape[-2], gt_depth.shape[-1]),
+                size=pred_depth.shape[-2:],
+                mode='nearest',
+            ).reshape(b, c, pred_depth.shape[-2], pred_depth.shape[-1])
+
+        if self.enable_nan_checks:
+            self._check_finite(gt_depth, "gt_depth_head")
+            self._check_finite(pred_depth, "pred_depth_head")
+
+        mask_depth = torch.isfinite(gt_depth)
+        mask_depth = torch.logical_and(mask_depth, gt_depth > self.min_depth)
+        mask_depth = torch.logical_and(mask_depth, gt_depth < self.max_depth)
+        mask_depth = mask_depth.to(torch.float32)
+        valid_depth_count = torch.sum(mask_depth)
+        if valid_depth_count.item() == 0:
+            return torch.zeros((), device=pred_depth.device, dtype=pred_depth.dtype)
+
+        abs_diff = torch.abs(gt_depth - pred_depth) * mask_depth
+        l1loss = torch.where(abs_diff < beta, 0.5 * abs_diff * abs_diff / beta, abs_diff - 0.5 * beta)
+        l1loss = torch.sum(l1loss) / (valid_depth_count + eps)
+        if self.enable_nan_checks:
+            self._check_finite(l1loss, "depth_head_l1loss")
+        return self.lambda_depth * l1loss
 
     def compute_norm_loss(self, batch_data):
 

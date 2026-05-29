@@ -142,6 +142,7 @@ class VGGT4DGS_LITDataModule(pl.LightningDataModule):
                        jittering=jittering if mode=='train' else [],
                        jittering_prob=jittering_prob if mode=='train' else 0.0,),
             'depth_type': self.depth_type if 'gt_depth' in self.train_requirements else None,
+            'depth_root': getattr(self, 'depth_root', None),
             'with_pose': 'gt_pose' in self.train_requirements,
             'with_ego_pose': 'gt_ego_pose' in self.train_requirements,
             'with_mask': 'mask' in self.train_requirements,
@@ -226,4 +227,3 @@ if __name__ == '__main__':
         rgb = inputs[('color_org', 0)][cam_id]
         rgb = rgb.cpu().numpy().transpose(1, 2, 0).clip(0, 1) * 255
         pil.fromarray(rgb.astype(np.uint8)).save('rgb_org_%d.png' % cam_id)
-

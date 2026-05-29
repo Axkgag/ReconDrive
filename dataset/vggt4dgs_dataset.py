@@ -4,6 +4,7 @@
 # Copyright (c) TuojingAI. All rights reserved.                  #
 #----------------------------------------------------------------#
 
+import json
 import os
 
 import numpy as np
@@ -36,6 +37,7 @@ class NuScenesdataset4D(Dataset):
                  forward_context=1,
                  data_transform=None,
                  depth_type=None,
+                 depth_root=None,
                  with_pose=None,
                  with_ego_pose=None,
                  with_mask=None,
@@ -64,7 +66,11 @@ class NuScenesdataset4D(Dataset):
         self.has_context = False
         self.data_transform = data_transform
 
-        self.with_depth = depth_type is not None
+        self.depth_type = depth_type
+        self.depth_root = depth_root
+        if self.depth_type == 'dense' and self.depth_root is None:
+            self.depth_root = os.path.join(self.path, 'depth_gt')
+        self.with_depth = depth_type is not None or depth_root is not None
         self.with_pose = with_pose
         self.with_ego_pose = with_ego_pose
 
@@ -74,6 +80,9 @@ class NuScenesdataset4D(Dataset):
         cur_path = os.path.dirname(os.path.realpath(__file__))        
         self.mask_path = os.path.join(cur_path, 'nuscenes_mask')
         self.mask_loader = mask_loader_scene
+        self.enable_occ_supervision = kwargs.get('enable_occ_supervision', False)
+        self.filter_missing_occ = kwargs.get('filter_missing_occ', False)
+        self.occ_data_path = kwargs.get('occ_data_path', None)
         self.occ_mask_dir = kwargs.get('occ_mask_dir', None)
 
         self.dataset = NuScenes(version=self.version, dataroot=self.path, verbose=True)
@@ -95,11 +104,13 @@ class NuScenesdataset4D(Dataset):
         self.min_context_num = min_context_num
         self.num_context_timesteps = num_context_timesteps
         self.num_target_timesteps = num_target_timesteps
+
+        self._sample_index_cache_path = self._build_sample_index_cache_path()
+        self._sample_index_cache_meta = self._build_sample_index_cache_meta()
         
-        self.sample_tokens = []
-        self.scenes_data = []
-        self.scene_names = []
-        self.scene_tokens = []
+        self._all_scene_sample_tokens = []
+        self._all_scene_names = []
+        self._all_scene_tokens = []
         for scene in self.dataset.scene:
             if scene['name'] in official_scene_names:  
                 scene_name = scene['name']
@@ -125,16 +136,198 @@ class NuScenesdataset4D(Dataset):
                         if i + self.context_span < len(scene_sample_tokens):  # Ensure we can get the target frame
                             valid_start_frames.append(scene_sample_tokens[i])
                     
-                    self.sample_tokens.extend(valid_start_frames)
+                    scene_sample_tokens = valid_start_frames
                 else:
                     # Original mode (v1.0-trainval): no frame skipping, use consecutive frames
                     scene_sample_tokens = scene_sample_tokens[self.bwd:len(scene_sample_tokens)-max(self.fwd, self.min_context_num, self.context_span)]
-                    self.sample_tokens.extend(scene_sample_tokens)
-                if len(scene_sample_tokens) > 0:  # Only add scenes with valid samples
-                    self.scenes_data.append(scene_sample_tokens)
-                    self.scene_names.append(scene_name)
-                    self.scene_tokens.append(scene_token)
-        print('Num of samlpe_tokens: ',len(self.sample_tokens))
+                if len(scene_sample_tokens) > 0:
+                    self._all_scene_sample_tokens.append(scene_sample_tokens)
+                    self._all_scene_names.append(scene_name)
+                    self._all_scene_tokens.append(scene_token)
+
+        if type(self) is NuScenesdataset4D:
+            self.rebuild_sample_index(announce=True)
+
+    def _build_sample_index_cache_path(self):
+        if not self.cache_dir:
+            return None
+        os.makedirs(self.cache_dir, exist_ok=True)
+        dataset_name = self.__class__.__name__.lower()
+        depth_tag = self.depth_type or 'none'
+        occ_tag = 'occ' if (self.occ_data_path or self.occ_mask_dir or self.enable_occ_supervision) else 'noocc'
+        filename = f"sample_index_{dataset_name}_{self.stage}_{self.version}_{depth_tag}_{occ_tag}.json"
+        return os.path.join(self.cache_dir, filename)
+
+    def _build_sample_index_cache_meta(self):
+        return {
+            'cache_version': 1,
+            'dataset_class': self.__class__.__name__,
+            'stage': getattr(self, 'stage', None),
+            'version': getattr(self, 'version', None),
+            'path': os.path.abspath(self.path),
+            'cache_dir': os.path.abspath(self.cache_dir) if self.cache_dir else None,
+            'depth_type': getattr(self, 'depth_type', None),
+            'depth_root': os.path.abspath(self.depth_root) if self.depth_root else None,
+            'with_depth': getattr(self, 'with_depth', False),
+            'enable_occ_supervision': getattr(self, 'enable_occ_supervision', False),
+            'filter_missing_occ': getattr(self, 'filter_missing_occ', False),
+            'occ_data_path': os.path.abspath(self.occ_data_path) if getattr(self, 'occ_data_path', None) else None,
+            'occ_mask_dir': os.path.abspath(self.occ_mask_dir) if getattr(self, 'occ_mask_dir', None) else None,
+            'cameras': list(getattr(self, 'cameras', []) or []),
+            'bwd': getattr(self, 'bwd', None),
+            'fwd': getattr(self, 'fwd', None),
+            'context_span': getattr(self, 'context_span', None),
+            'min_context_num': getattr(self, 'min_context_num', None),
+            'num_context_timesteps': getattr(self, 'num_context_timesteps', None),
+            'num_target_timesteps': getattr(self, 'num_target_timesteps', None),
+        }
+
+    def _load_sample_index_cache(self):
+        if not self._sample_index_cache_path or not os.path.exists(self._sample_index_cache_path):
+            return None
+        with open(self._sample_index_cache_path, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+        if payload.get('meta') != self._sample_index_cache_meta:
+            return None
+        return payload
+
+    def _save_sample_index_cache(self, payload):
+        if not self._sample_index_cache_path:
+            return
+        tmp_path = self._sample_index_cache_path + '.tmp'
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, self._sample_index_cache_path)
+
+    def _sample_image_path(self, cam_sample):
+        return os.path.join(self.path, cam_sample['filename'])
+
+    def _sample_depth_path(self, cam_sample):
+        if self.depth_root is None:
+            return None
+        rel_path = os.path.splitext(cam_sample['filename'])[0]
+        depth_file_npy = os.path.join(self.depth_root, rel_path + '.npy')
+        if os.path.exists(depth_file_npy):
+            return depth_file_npy
+        depth_file_npz = os.path.join(self.depth_root, rel_path + '.npz')
+        if os.path.exists(depth_file_npz):
+            return depth_file_npz
+        return depth_file_npy
+
+    def _needs_depth_validation(self):
+        return self.with_depth and self.depth_root is not None
+
+    def _sample_has_occ_data(self, sample_token):
+        return True
+
+    def _sample_has_required_files(self, sample_token):
+        sample = self.dataset.get('sample', sample_token)
+        for cam in self.cameras:
+            cam_sample = self.dataset.get('sample_data', sample['data'][cam])
+            if not os.path.exists(self._sample_image_path(cam_sample)):
+                return False
+            if self._needs_depth_validation():
+                depth_path = self._sample_depth_path(cam_sample)
+                if depth_path is None or not os.path.exists(depth_path):
+                    return False
+        return self._sample_has_occ_data(sample_token)
+
+    def rebuild_sample_index(self, announce=True):
+        cached = self._load_sample_index_cache()
+        if cached is not None:
+            self.sample_tokens = cached['sample_tokens']
+            self.scenes_data = cached['scenes_data']
+            self.scene_names = cached['scene_names']
+            self.scene_tokens = cached['scene_tokens']
+            stats = cached.get('stats', {})
+            if announce:
+                print(f"Loaded sample index cache: {self._sample_index_cache_path}")
+                print(f"Dataset samples before filtering: {stats.get('raw_sample_count', len(self.sample_tokens))}")
+                print(f"Dataset samples after filtering:  {len(self.sample_tokens)}")
+                if stats:
+                    print(
+                        f"Filtered out -> image: {stats.get('missing_image', 0)}, "
+                        f"depth: {stats.get('missing_depth', 0)}, "
+                        f"occ: {stats.get('missing_occ', 0)}"
+                    )
+            return
+
+        filtered_sample_tokens = []
+        filtered_scenes_data = []
+        filtered_scene_names = []
+        filtered_scene_tokens = []
+        missing_image = 0
+        missing_depth = 0
+        missing_occ = 0
+
+        raw_sample_count = sum(len(scene_tokens) for scene_tokens in self._all_scene_sample_tokens)
+        for scene_sample_tokens, scene_name, scene_token in zip(
+            self._all_scene_sample_tokens,
+            self._all_scene_names,
+            self._all_scene_tokens,
+        ):
+            valid_scene_tokens = []
+            for sample_token in scene_sample_tokens:
+                sample = self.dataset.get('sample', sample_token)
+                missing_reason = None
+                for cam in self.cameras:
+                    cam_sample = self.dataset.get('sample_data', sample['data'][cam])
+                    if not os.path.exists(self._sample_image_path(cam_sample)):
+                        missing_reason = 'image'
+                        break
+                    if self._needs_depth_validation():
+                        depth_path = self._sample_depth_path(cam_sample)
+                        if depth_path is None or not os.path.exists(depth_path):
+                            missing_reason = 'depth'
+                            break
+                if missing_reason is None and not self._sample_has_occ_data(sample_token):
+                    missing_reason = 'occ'
+
+                if missing_reason is None:
+                    valid_scene_tokens.append(sample_token)
+                else:
+                    if missing_reason == 'image':
+                        missing_image += 1
+                    elif missing_reason == 'depth':
+                        missing_depth += 1
+                    elif missing_reason == 'occ':
+                        missing_occ += 1
+
+            if len(valid_scene_tokens) > 0:
+                filtered_sample_tokens.extend(valid_scene_tokens)
+                filtered_scenes_data.append(valid_scene_tokens)
+                filtered_scene_names.append(scene_name)
+                filtered_scene_tokens.append(scene_token)
+
+        self.sample_tokens = filtered_sample_tokens
+        self.scenes_data = filtered_scenes_data
+        self.scene_names = filtered_scene_names
+        self.scene_tokens = filtered_scene_tokens
+
+        self._save_sample_index_cache({
+            'meta': self._sample_index_cache_meta,
+            'sample_tokens': self.sample_tokens,
+            'scenes_data': self.scenes_data,
+            'scene_names': self.scene_names,
+            'scene_tokens': self.scene_tokens,
+            'stats': {
+                'raw_sample_count': raw_sample_count,
+                'filtered_sample_count': len(self.sample_tokens),
+                'missing_image': missing_image,
+                'missing_depth': missing_depth,
+                'missing_occ': missing_occ,
+            },
+        })
+
+        if announce:
+            if self._sample_index_cache_path:
+                print(f"Saved sample index cache: {self._sample_index_cache_path}")
+            print(f"Dataset samples before filtering: {raw_sample_count}")
+            print(f"Dataset samples after filtering:  {len(self.sample_tokens)}")
+            if raw_sample_count != len(self.sample_tokens):
+                print(
+                    f"Filtered out -> image: {missing_image}, depth: {missing_depth}, occ: {missing_occ}"
+                )
 
     def get_current(self, key, cam_sample):
         """
@@ -400,11 +593,38 @@ class NuScenesdataset4D(Dataset):
         
         return velocity_ego
     
+    def _load_dense_depth_map(self, sensor, cam_sample):
+        if self.depth_root is None:
+            raise ValueError("dense depth requested but depth_root is not set")
+
+        rel_path = os.path.splitext(cam_sample['filename'])[0]
+        depth_file_npy = os.path.join(self.depth_root, rel_path + '.npy')
+        depth_file_npz = os.path.join(self.depth_root, rel_path + '.npz')
+
+        if os.path.exists(depth_file_npy):
+            depth = np.load(depth_file_npy)
+        elif os.path.exists(depth_file_npz):
+            loaded = np.load(depth_file_npz, allow_pickle=True)
+            if 'depth' in loaded:
+                depth = loaded['depth']
+            else:
+                depth = loaded[loaded.files[0]]
+        else:
+            raise FileNotFoundError(f"Dense depth file not found: {depth_file_npy}")
+
+        depth = np.asarray(depth, dtype=np.float32)
+        if depth.ndim == 3 and depth.shape[-1] == 1:
+            depth = depth[..., 0]
+        return depth
+
     def generate_depth_map(self, sample, sensor, cam_sample):
         """
         This function returns depth map for nuscenes dataset,
         result of depth map is saved in nuscenes/samples/DEPTH_MAP
         """        
+        if self.depth_type == 'dense' or self.depth_root is not None:
+            return self._load_dense_depth_map(sensor, cam_sample)
+
         # generate depth filename
         filename = '{}/{}.npz'.format(
                         os.path.join(os.path.dirname(self.cache_dir), 'samples'),

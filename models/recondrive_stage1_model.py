@@ -108,6 +108,11 @@ class ReconDriveStage1_LITModelModule(ReconDrive_LITModelModule):
         batch_splating_data = self._apply_occ_render_mask(batch_splating_data, batch_input)
 
         loss_gaussian = self.compute_gaussian_loss(batch_splating_data)
+        loss_depth = (
+            self.compute_depth_head_loss(batch_recontrast_data, batch_input)
+            if getattr(self, 'enable_depth_supervision', False)
+            else None
+        )
 
         # 新增：计算 Occ 损失（仅在启用时）
         if getattr(self, 'enable_occ_supervision', False):
@@ -118,8 +123,12 @@ class ReconDriveStage1_LITModelModule(ReconDrive_LITModelModule):
 
         self.log(f'{stage}/gs', loss_gaussian.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log(f'{stage}/norm', loss_norm.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        if loss_depth is not None:
+            self.log(f'{stage}/depth', loss_depth.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
 
         loss_all = loss_gaussian + loss_norm + loss_occ
+        if loss_depth is not None:
+            loss_all = loss_all + loss_depth
         psnr, ssim, lpips = self.compute_reconstruction_metrics(batch_splating_data, stage)
 
         # Training visualization
@@ -160,11 +169,20 @@ class ReconDriveStage1_LITModelModule(ReconDrive_LITModelModule):
         )
         batch_splating_data = self._apply_occ_render_mask(batch_splating_data, batch_input)
         loss_gaussian = self.compute_gaussian_loss(batch_splating_data)
+        loss_depth = (
+            self.compute_depth_head_loss(batch_recontrast_data, batch_input)
+            if getattr(self, 'enable_depth_supervision', False)
+            else None
+        )
 
         self.log(f'{stage}/gs', loss_gaussian.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log(f'{stage}/norm', loss_norm.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        if loss_depth is not None:
+            self.log(f'{stage}/depth', loss_depth.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
 
         loss_all = loss_gaussian + loss_norm
+        if loss_depth is not None:
+            loss_all = loss_all + loss_depth
         psnr, ssim, lpips = self.compute_reconstruction_metrics(batch_splating_data, stage)
 
         # Validation visualization (limited per epoch)
@@ -204,11 +222,20 @@ class ReconDriveStage1_LITModelModule(ReconDrive_LITModelModule):
         )
         batch_splating_data = self._apply_occ_render_mask(batch_splating_data, batch_input)
         loss_gaussian = self.compute_gaussian_loss(batch_splating_data)
+        loss_depth = (
+            self.compute_depth_head_loss(batch_recontrast_data, batch_input)
+            if getattr(self, 'enable_depth_supervision', False)
+            else None
+        )
 
         self.log(f'{stage}/gs', loss_gaussian.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log(f'{stage}/norm', loss_norm.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        if loss_depth is not None:
+            self.log(f'{stage}/depth', loss_depth.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
 
         loss_all = loss_gaussian + loss_norm
+        if loss_depth is not None:
+            loss_all = loss_all + loss_depth
         psnr, ssim, lpips = self.compute_reconstruction_metrics(batch_splating_data, stage)
 
         del batch_input, batch_recontrast_data, batch_render_data, batch_splating_data
@@ -238,7 +265,7 @@ class ReconDriveStage1_LITModelModule(ReconDrive_LITModelModule):
             os.makedirs(save_dir, exist_ok=True)
 
             frame_id = 0
-            gt_imgs, stage1_imgs, pred_depth_imgs = [], [], []
+            gt_imgs, stage1_imgs, pred_depth_imgs, gt_depth_imgs = [], [], [], []
 
             # Pre-extract predicted depth maps: [B, num_cams*H*W] -> [num_cams, H, W]
             pred_depths_all = None
@@ -255,6 +282,7 @@ class ReconDriveStage1_LITModelModule(ReconDrive_LITModelModule):
             for cam_id in range(self.num_cams):
                 pred_key = ('gaussian_color', frame_id, cam_id)
                 gt_key   = ('groudtruth',     frame_id, cam_id)
+                gt_depth_key = ('gt_depths', frame_id, cam_id)
 
                 if pred_key not in batch_splating_data or gt_key not in batch_splating_data:
                     return
@@ -285,14 +313,25 @@ class ReconDriveStage1_LITModelModule(ReconDrive_LITModelModule):
                 else:
                     pred_depth_imgs.append(None)
 
+                if gt_depth_key in batch_splating_data:
+                    gt_depth_np = batch_splating_data[gt_depth_key][0].detach().cpu().float().numpy()
+                    gt_depth_imgs.append(np.squeeze(gt_depth_np))
+                else:
+                    gt_depth_imgs.append(None)
+
             stage1_3d_img = self._render_gaussian_scene_image(batch_recontrast_data, batch_idx_in_batch=0)
 
+            has_gt_depth_vis = any(depth is not None for depth in gt_depth_imgs)
+            ncols = 5 if has_gt_depth_vis else 4
             fig, axes = plt.subplots(
-                nrows=self.num_cams, ncols=4,
-                figsize=(4 * 4, self.num_cams * 2.3),
+                nrows=self.num_cams, ncols=ncols,
+                figsize=(4 * ncols, self.num_cams * 2.3),
                 dpi=120,
             )
-            col_titles = ['GT Image', 'Stage1 Render', 'Pred Depth', 'Stage1 3D Gauss']
+            col_titles = ['GT Image', 'Stage1 Render', 'Pred Depth']
+            if has_gt_depth_vis:
+                col_titles.append('GT Depth')
+            col_titles.append('Stage1 3D Gauss')
 
             for cam_id in range(self.num_cams):
                 cam_name = (self.camera_names[cam_id]
@@ -303,15 +342,24 @@ class ReconDriveStage1_LITModelModule(ReconDrive_LITModelModule):
 
                 depth_np = pred_depth_imgs[cam_id]
                 if depth_np is not None:
-                    axes[cam_id, 2].imshow(depth_np, cmap='magma')
+                    axes[cam_id, 2].imshow(depth_np, cmap='magma', vmin=self.min_depth, vmax=self.max_depth)
                 else:
                     axes[cam_id, 2].text(0.5, 0.5, 'N/A', ha='center', va='center',
                                          transform=axes[cam_id, 2].transAxes)
 
-                axes[cam_id, 3].imshow(stage1_3d_img)
+                if has_gt_depth_vis:
+                    gt_depth_np = gt_depth_imgs[cam_id]
+                    if gt_depth_np is not None:
+                        axes[cam_id, 3].imshow(gt_depth_np, cmap='magma', vmin=self.min_depth, vmax=self.max_depth)
+                    else:
+                        axes[cam_id, 3].text(0.5, 0.5, 'N/A', ha='center', va='center',
+                                             transform=axes[cam_id, 3].transAxes)
+                    axes[cam_id, 4].imshow(stage1_3d_img)
+                else:
+                    axes[cam_id, 3].imshow(stage1_3d_img)
 
                 axes[cam_id, 0].set_ylabel(cam_name, fontsize=9)
-                for c in range(4):
+                for c in range(ncols):
                     axes[cam_id, c].set_xticks([])
                     axes[cam_id, c].set_yticks([])
                     if cam_id == 0:

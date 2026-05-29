@@ -39,60 +39,13 @@ class NuScenesdataset3D(NuScenesdataset4D):
                 raise FileNotFoundError(f"Occ 数据目录未找到: {self.occ_base_path}")
             print(f"启用 Occ 数据加载，路径: {self.occ_base_path}")
 
-        self._build_all_frame_tokens()
+        self.rebuild_sample_index(announce=True)
 
-    def _build_all_frame_tokens(self):
-        if self.stage == 'train':
-            official_scene_names = splits.train
-        elif self.stage == 'val':
-            official_scene_names = splits.val
-        elif self.stage == 'test':
-            official_scene_names = [
-                'scene-0014', 'scene-0018', 'scene-0906', 'scene-0098',
-                'scene-0100', 'scene-0103', 'scene-0270', 'scene-0271',
-                'scene-0278', 'scene-0553', 'scene-0558',
-                'scene-0802', 'scene-0968', 'scene-1065',
-            ]
-        else:
-            raise ValueError("stage should be 'train' / 'val'/ 'test' ")
-
-        self.sample_tokens = []
-        self.scenes_data = []
-        self.scene_names = []
-        self.scene_tokens = []
-
-        for scene in self.dataset.scene:
-            if scene['name'] not in official_scene_names:
-                continue
-            scene_name = scene['name']
-            scene_token = scene['token']
-            sample_token = scene['first_sample_token']
-            scene_sample_tokens = []
-            while sample_token:
-                scene_sample_tokens.append(sample_token)
-                sample = self.dataset.get('sample', sample_token)
-                sample_token = sample['next']
-
-            if len(scene_sample_tokens) > 0:
-                # 新增：如果启用 Occ 且需要过滤，则移除没有 Occ 数据的样本
-                if self.enable_occ_supervision and self.filter_missing_occ:
-                    filtered_tokens = []
-                    for token in scene_sample_tokens:
-                        occ_file = os.path.join(self.occ_base_path, token, 'labels.npz')
-                        if os.path.exists(occ_file):
-                            filtered_tokens.append(token)
-                    if len(filtered_tokens) < len(scene_sample_tokens):
-                        print(f"场景 {scene_name}: 过滤了 {len(scene_sample_tokens) - len(filtered_tokens)} 个没有 Occ 数据的样本")
-                    scene_sample_tokens = filtered_tokens
-
-                # 只有在过滤后仍有样本时才添加
-                if len(scene_sample_tokens) > 0:
-                    self.sample_tokens.extend(scene_sample_tokens)
-                    self.scenes_data.append(scene_sample_tokens)
-                    self.scene_names.append(scene_name)
-                    self.scene_tokens.append(scene_token)
-
-        print('Num of samlpe_tokens: ', len(self.sample_tokens))
+    def _sample_has_occ_data(self, sample_token):
+        if not self.enable_occ_supervision or not self.filter_missing_occ:
+            return True
+        occ_file = os.path.join(self.occ_base_path, sample_token, 'labels.npz')
+        return os.path.exists(occ_file)
 
     def __getitem__(self, idx: int, context_frame_idx: int = -1, return_all: bool = False) -> Dict[str, Any]:
         actual_idx = idx

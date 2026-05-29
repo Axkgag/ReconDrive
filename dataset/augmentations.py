@@ -295,7 +295,7 @@ def to_tensor_sample(sample, tensor_type='torch.FloatTensor'):
     """
     transform = transforms.ToTensor()
     for key in filter_dict(sample, [
-        'rgb', 'rgb_original', 'depth', 'input_depth',
+        'rgb', 'rgb_original', 'depth', 'input_depth', 'gt_depth',
     ]):
         sample[key] = transform(sample[key]).type(tensor_type)
     for key in filter_dict(sample, [

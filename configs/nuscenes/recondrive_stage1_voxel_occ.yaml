@@ -54,9 +54,9 @@ model_cfg:
   lambda_opacity: 0.01
   lambda_edge: 0.1
   lambda_depth: 0.001
-  enable_depth_supervision: false
+  enable_depth_supervision: true
   # depth_head 解冻范围: none | output_conv2 | output_conv1 | refinenet | full
-  depth_head_unfreeze: 'none'
+  depth_head_unfreeze: 'output_conv2'
 
   # Occ 监督配置（引用统一开关）
   enable_occ_supervision: *enable_occ  # 引用全局开关
@@ -77,6 +77,7 @@ data_cfg:
   back_context: 0
   forward_context: 0
   depth_type: 'lidar'
+  depth_root: './data/nuscenes/depth_gt'
   nuscenes_version: 'v1.0-trainval'
   context_span: 0
   cameras: ['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT', 'CAM_BACK']

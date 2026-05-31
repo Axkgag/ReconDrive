@@ -97,6 +97,7 @@ class ReconDriveStage1_LITModelModule(ReconDrive_LITModelModule):
 
         self._set_stage1_frame_ids()
         self._log_weights_and_grads(batch_input)
+        self._log_current_lrs()
 
         batch_recontrast_data = self.get_recontrast_data(batch_input, batch_idx)
         loss_norm = self.compute_norm_loss(batch_recontrast_data)

@@ -624,7 +624,7 @@ class ReconDriveVoxelModel(torch.nn.Module):
 
         self.track_head = None
 
-    def forward(self, images, intrinsics, extrinsics):
+    def forward(self, images, intrinsics, extrinsics, depth_maps_override=None):
         """
         images: [B, V, 3, H, W]
         intrinsics: [B, V, 4, 4] or [B, V, 3, 3]
@@ -642,11 +642,15 @@ class ReconDriveVoxelModel(torch.nn.Module):
             depth_range = self.max_depth - self.min_depth
             depth_maps = self.min_depth + depth_range * depth_maps
 
+            depth_maps_for_voxel = depth_maps_override if depth_maps_override is not None else depth_maps
+            if depth_maps_for_voxel.dim() == 5 and depth_maps_for_voxel.shape[-1] == 1:
+                depth_maps_for_voxel = depth_maps_for_voxel[..., 0]
+
             raw_gaussian = self.gs_head(
                 aggregated_tokens_list,
                 images=images,
                 patch_start_idx=patch_start_idx,
-                depth_maps=depth_maps,
+                depth_maps=depth_maps_for_voxel,
                 intrinsics=intrinsics,
                 extrinsics=extrinsics,
             )
@@ -694,6 +698,9 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         super().__init__()
         self.read_config(cfg)
         self.enable_nan_checks = getattr(self, 'enable_nan_checks', True)
+        self.use_separate_depth_optimizer = getattr(self, 'use_separate_depth_optimizer', False)
+        self.lr_min_factor = getattr(self, 'lr_min_factor', 0.01)
+        self.voxel_depth_source = getattr(self, 'voxel_depth_source', 'pred')
 
         # Set default values for ego transformation configuration if not in config
         if not hasattr(self, 'translate_3dgs'):
@@ -964,6 +971,7 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
         self.prob_sample_rendered_ids()
         self._log_weights_and_grads(batch_input)
+        self._log_current_lrs()
 
         batch_recontrast_data = self.get_recontrast_data(batch_input, batch_idx)
 
@@ -1229,60 +1237,95 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             optimizer.zero_grad()
             return False
         return True
-                        
+
+    def _log_current_lrs(self):
+        optimizer = None
+        if getattr(self.trainer, "optimizers", None):
+            optimizer = self.trainer.optimizers[0]
+        if optimizer is None:
+            return
+
+        lr_main = None
+        lr_depth = None
+        for idx, group in enumerate(optimizer.param_groups):
+            group_name = group.get("name")
+            group_lr = group.get("lr", None)
+            if group_name == "main" or (group_name is None and idx == 0):
+                lr_main = group_lr
+            elif group_name == "depth" or (group_name is None and idx == 1):
+                lr_depth = group_lr
+
+        if lr_main is not None:
+            self.log("train/lr_main", lr_main, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+        if lr_depth is not None:
+            self.log("train/lr_depth", lr_depth, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+
     def configure_optimizers(self):
-        # Collect all trainable parameters (simplified, no parameter groups)
         trainable_params = []
-        trainable_param_names = []
+        main_params = []
+        depth_params = []
+
+        use_depth_group = getattr(self, 'use_separate_depth_optimizer', False) or getattr(self, 'depth_head_lr', self.learning_rate) != self.learning_rate
 
         for name, parameters in self.model.named_parameters():
-            if parameters.requires_grad:
-                trainable_params.append(parameters)
-                trainable_param_names.append(name)
-                print(f'Training parameter: {name}')
+            if not parameters.requires_grad:
+                continue
+            trainable_params.append(parameters)
+            if use_depth_group and name.startswith('depth_head'):
+                depth_params.append(parameters)
+            else:
+                main_params.append(parameters)
+            print(f'Training parameter: {name}')
 
         if self.auto_scale_lr:
             num_devices = self.trainer.num_devices
-            scale_devices = max(1, log2(num_devices))  
+            scale_devices = max(1, log2(num_devices))
             base_lr = self.learning_rate * scale_devices
+            depth_lr = getattr(self, 'depth_head_lr', self.learning_rate) * scale_devices
         else:
             base_lr = self.learning_rate
-
-        print(f"\nOptimizer configuration (simplified):")
-        print(f"  Total trainable parameters: {len(trainable_params)}")
-        print(f"  Learning rate: {base_lr}")
-        print(f"  Using single learning rate for all parameters")
-        
-        # Verify we're training depth_head and gs_head
-        depth_head_count = sum(1 for name in trainable_param_names if 'depth_head' in name)
-        gs_head_count = sum(1 for name in trainable_param_names if 'gs_head' in name)
-        other_count = len(trainable_param_names) - depth_head_count - gs_head_count
-        print(f"  - depth_head parameters: {depth_head_count}")
-        print(f"  - gs_head parameters: {gs_head_count}")
-        if other_count > 0:
-            print(f"  - WARNING: {other_count} other parameters are also trainable")
+            depth_lr = getattr(self, 'depth_head_lr', self.learning_rate)
 
         if not trainable_params:
             print("ERROR: No trainable parameters found!")
-            # Create dummy parameter to avoid crash
             trainable_params = [torch.nn.Parameter(torch.zeros(1))]
+            main_params = trainable_params
 
-        # Create simple optimizer without parameter groups
-        optimizer = optim.AdamW(trainable_params, lr=base_lr, betas=(0.9,0.98), eps=1e-7, weight_decay=self.weight_decay)
+        if use_depth_group and depth_params and main_params:
+            param_groups = [
+                {'params': main_params, 'lr': base_lr, 'weight_decay': self.weight_decay, 'name': 'main'},
+                {'params': depth_params, 'lr': depth_lr, 'weight_decay': getattr(self, 'depth_head_weight_decay', self.weight_decay), 'name': 'depth'},
+            ]
+            print(f"\nOptimizer configuration (param groups):")
+            print(f"  Main params: {len(main_params)}")
+            print(f"  Depth-head params: {len(depth_params)}")
+            print(f"  Main lr: {base_lr}")
+            print(f"  Depth-head lr: {depth_lr}")
+        else:
+            param_groups = [{'params': trainable_params, 'lr': base_lr, 'weight_decay': self.weight_decay, 'name': 'main'}]
+            print(f"\nOptimizer configuration (single group):")
+            print(f"  Total trainable parameters: {len(trainable_params)}")
+            print(f"  Learning rate: {base_lr}")
 
-        # scheduler = torch.optim.lr_scheduler.StepLR(optimizer,step_size=self.scheduler_step_size,gamma=self.scheduler_gamma)
+        optimizer = optim.AdamW(param_groups, betas=(0.9, 0.98), eps=1e-7)
+
+        total_steps = getattr(self.trainer, 'estimated_stepping_batches', None)
+        if total_steps is None or not np.isfinite(total_steps):
+            total_steps = getattr(self.trainer, 'num_training_batches', None)
+        if total_steps is None or not np.isfinite(total_steps):
+            total_steps = 1
+        train_batches = max(1, int(total_steps))
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
                     optimizer,
-                    T_0=self.lr_restart_epoch,  
+                    T_0=max(1, int(self.lr_restart_epoch * train_batches)),
                     T_mult=self.lr_restart_mult,
-                    eta_min=base_lr*self.lr_min_factor*0.1  
+                    eta_min=base_lr * self.lr_min_factor * 0.1
                 )
-
         return {
             'optimizer': optimizer,
             'lr_scheduler': {
                 'scheduler': scheduler,
-                'interval': 'epoch'
+                'interval': 'step'
             }
         }
     
@@ -1530,7 +1573,19 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         # [4, 6, 280, 518, 1], [4, 6, 280, 518, 4], [4, 6, 280, 518, 3], [4, 6, 280, 518, 1], [4, 6, 280, 518, 3, 25], [4, 6, 280, 518, 3]
         offset_maps = None
         if getattr(self, 'model_variant', 'standard') == 'voxel':
-            model_out = self.model(image_list, inputs['K'], inputs['c2e_extr'])
+            depth_override = None
+            voxel_depth_source = getattr(self, 'voxel_depth_source', 'pred')
+            if voxel_depth_source == 'gt':
+                depth_override = self._prepare_voxel_depth_override(
+                    inputs.get('gt_depth', None),
+                    image_list.shape[-2:],
+                    image_list.device,
+                    image_list.dtype,
+                )
+            if depth_override is not None:
+                model_out = self.model(image_list, inputs['K'], inputs['c2e_extr'], depth_maps_override=depth_override)
+            else:
+                model_out = self.model(image_list, inputs['K'], inputs['c2e_extr'])
         else:
             model_out = self.model(image_list)
 
@@ -2718,6 +2773,28 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         if self.enable_nan_checks:
             self._check_finite(l1loss, "depth_head_l1loss")
         return self.lambda_depth * l1loss
+
+    def _prepare_voxel_depth_override(self, gt_depth, target_hw, device, dtype):
+        if gt_depth is None:
+            return None
+        if not torch.is_tensor(gt_depth):
+            gt_depth = torch.as_tensor(gt_depth)
+        if gt_depth.dim() == 5 and gt_depth.shape[-1] == 1:
+            gt_depth = gt_depth.squeeze(-1)
+        elif gt_depth.dim() == 5 and gt_depth.shape[2] == 1:
+            gt_depth = gt_depth.squeeze(2)
+        elif gt_depth.dim() == 3:
+            gt_depth = gt_depth.unsqueeze(1)
+        if gt_depth.dim() != 4:
+            return None
+        if gt_depth.shape[-2:] != target_hw:
+            b, c, h, w = gt_depth.shape
+            gt_depth = F.interpolate(
+                gt_depth.reshape(b * c, 1, h, w).to(device=device, dtype=dtype),
+                size=target_hw,
+                mode='nearest',
+            ).reshape(b, c, target_hw[0], target_hw[1])
+        return gt_depth.to(device=device, dtype=dtype)
 
     def compute_norm_loss(self, batch_data):
 

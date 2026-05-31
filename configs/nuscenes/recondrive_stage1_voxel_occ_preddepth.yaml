@@ -18,11 +18,11 @@ model_cfg:
   auto_scale_lr: True
   enable_nan_checks: true
   learning_rate: 0.00001
-  use_separate_depth_optimizer: false  # true: depth_head 独立优化器；false: 与其他参数共用一个优化器
+  use_separate_depth_optimizer: true  # true: depth_head 使用独立参数组；false: 与其他参数共用一个参数组
   depth_head_lr: 0.000003             # depth_head 专用学习率，仅在 use_separate_depth_optimizer=true 时生效
   depth_head_weight_decay: 0.01       # depth_head 专用 weight decay
   voxel_depth_source: 'pred'          # voxel head lifting 的 depth 来源: pred/gt（默认 pred）
-
+  
   weight_decay: 0.01
   lr_restart_epoch: 5
   lr_restart_mult: 2
@@ -57,8 +57,8 @@ model_cfg:
   lambda_gaussian: 2
   lambda_scale: 0.01
   lambda_opacity: 0.01
-  lambda_edge: 0.1
-  lambda_depth: 0.001
+  lambda_edge: 0.01
+  lambda_depth: 0.01
   enable_depth_supervision: true
   # depth_head 解冻范围: none | output_conv2 | output_conv1 | refinenet | full
   depth_head_unfreeze: 'output_conv2'
@@ -81,8 +81,8 @@ data_cfg:
   width: 518
   back_context: 0
   forward_context: 0
-  depth_type: 'lidar'
-  depth_root: './data/nuscenes/depth_gt'
+  depth_type: 'dense'
+  depth_root: './data/nuscenes/depth'
   nuscenes_version: 'v1.0-trainval'
   context_span: 0
   cameras: ['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT', 'CAM_BACK']

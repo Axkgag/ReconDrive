@@ -1,6 +1,6 @@
 save_dir: './work_dirs/recondrive_stage1_voxel_training'
 seed: 42
-train_epoch: 20
+train_epoch: 30
 devices: [0,1,2,3,4,5,6,7]
 
 # Occ 监督统一开关（定义锚点，只需在此处修改）

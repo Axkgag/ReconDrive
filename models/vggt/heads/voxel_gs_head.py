@@ -2,7 +2,7 @@
 #
 # Voxel-based 3DGS head for ReconDrive (VolSplat-style lift + voxel aggregate).
 
-from typing import List, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -100,8 +100,60 @@ class VGGT_Voxel_GS_Head(nn.Module):
         intrinsics: torch.Tensor,
         extrinsics: torch.Tensor,
     ) -> torch.Tensor:
+        voxel_feats, unique_coords, inv, valid_idx, depth, shape, num_voxels = self.extract_voxel_features(
+            aggregated_tokens_list=aggregated_tokens_list,
+            images=images,
+            patch_start_idx=patch_start_idx,
+            depth_maps=depth_maps,
+            intrinsics=intrinsics,
+            extrinsics=extrinsics,
+        )
+
+        if voxel_feats is None:
+            b, s, h, w = shape
+            device = depth.device
+            raw_full = torch.zeros(
+                b * s * h * w, self.gaussians_per_voxel, self.raw_gs_dim, device=device, dtype=depth.dtype
+            )
+            raw_full[:, :, self.opacity_index] = self.invalid_opacity
+            return raw_full.view(b, s, h, w, self.gaussians_per_voxel, self.raw_gs_dim)
+
+        voxel_feats = self.refiner(voxel_feats, unique_coords)
+        voxel_params = self.decoder(voxel_feats).view(num_voxels, self.gaussians_per_voxel, self.raw_gs_dim)
+
+        b, s, h, w = shape
+        device = depth.device
+        raw_full = torch.zeros(
+            b * s * h * w, self.gaussians_per_voxel, self.raw_gs_dim, device=device, dtype=depth.dtype
+        )
+        raw_full[:, :, self.opacity_index] = self.invalid_opacity
+        raw_full[valid_idx] = voxel_params[inv]
+        raw_full_reshaped = raw_full.view(b, s, h, w, self.gaussians_per_voxel, self.raw_gs_dim)
+        return raw_full_reshaped
+
+    def extract_voxel_features(
+        self,
+        aggregated_tokens_list: List[torch.Tensor],
+        images: torch.Tensor,
+        patch_start_idx: int,
+        depth_maps: torch.Tensor,
+        intrinsics: torch.Tensor,
+        extrinsics: torch.Tensor,
+    ) -> Tuple[
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        torch.Tensor,
+        Tuple[int, int, int, int],
+        Optional[int],
+    ]:
         # 2D feature map from tokens: [B, S, C, H, W]
-        features = self.feature_head(aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx)
+        features = self.feature_head(
+            aggregated_tokens_list,
+            images=images,
+            patch_start_idx=patch_start_idx,
+        )
         features = features.permute(0, 1, 3, 4, 2).contiguous()  # [B, S, H, W, C]
 
         if depth_maps.dim() == 5 and depth_maps.shape[-1] == 1:
@@ -122,13 +174,15 @@ class VGGT_Voxel_GS_Head(nn.Module):
         k = intrinsics_4x4.view(b * s, 4, 4)
 
         points = depth2pc(depth.view(b * s, h, w), e2c, k)  # [B*S, H*W, 3]
-
         points_flat = points.reshape(-1, 3)
         feats_flat = features_flat.view(-1, c)
         batch_ids = torch.arange(b * s, device=device).unsqueeze(1).expand(b * s, h * w).reshape(-1)
 
         valid_mask = depth_flat.view(-1) > 0
-        voxel_coords = torch.floor((points_flat - points_flat.new_tensor([self.x_range[0], self.y_range[0], self.z_range[0]])) / self.voxel_size).long()
+        voxel_coords = torch.floor(
+            (points_flat - points_flat.new_tensor([self.x_range[0], self.y_range[0], self.z_range[0]]))
+            / self.voxel_size
+        ).long()
 
         nx = int((self.x_range[1] - self.x_range[0]) / self.voxel_size)
         ny = int((self.y_range[1] - self.y_range[0]) / self.voxel_size)
@@ -143,12 +197,7 @@ class VGGT_Voxel_GS_Head(nn.Module):
 
         valid_idx = valid_mask.nonzero(as_tuple=False).squeeze(-1)
         if valid_idx.numel() == 0:
-            raw_full = torch.zeros(
-                b * s * h * w, self.gaussians_per_voxel, self.raw_gs_dim, device=device, dtype=depth.dtype
-            )
-            raw_full[:, :, self.opacity_index] = self.invalid_opacity
-            raw_full_reshaped = raw_full.view(b, s, h, w, self.gaussians_per_voxel, self.raw_gs_dim)
-            return raw_full_reshaped
+            return None, None, None, None, depth, (b, s, h, w), None
 
         coords = torch.stack(
             [batch_ids[valid_idx], voxel_coords[valid_idx, 0], voxel_coords[valid_idx, 1], voxel_coords[valid_idx, 2]],
@@ -162,17 +211,7 @@ class VGGT_Voxel_GS_Head(nn.Module):
         counts = torch.zeros(num_voxels, 1, device=device, dtype=depth.dtype)
         counts.scatter_add_(0, inv.unsqueeze(-1), torch.ones_like(inv, dtype=depth.dtype).unsqueeze(-1))
         voxel_feats = voxel_feats / counts.clamp_min(1.0)
-
-        voxel_feats = self.refiner(voxel_feats, unique_coords)
-        voxel_params = self.decoder(voxel_feats).view(num_voxels, self.gaussians_per_voxel, self.raw_gs_dim)
-
-        raw_full = torch.zeros(
-            b * s * h * w, self.gaussians_per_voxel, self.raw_gs_dim, device=device, dtype=depth.dtype
-        )
-        raw_full[:, :, self.opacity_index] = self.invalid_opacity
-        raw_full[valid_idx] = voxel_params[inv]
-        raw_full_reshaped = raw_full.view(b, s, h, w, self.gaussians_per_voxel, self.raw_gs_dim)
-        return raw_full_reshaped
+        return voxel_feats, unique_coords, inv, valid_idx, depth, (b, s, h, w), num_voxels
 
     @staticmethod
     def _ensure_4x4(matrix: torch.Tensor, device: torch.device, dtype: torch.dtype) -> torch.Tensor:

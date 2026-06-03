@@ -1,9 +1,5 @@
-save_dir: './work_dirs/recondrive_stage1_voxel_training'
 seed: 42
-train_epoch: 30
-devices: [0,1,2,3,4,5,6,7]
 
-# Occ 监督统一开关（定义锚点，只需在此处修改）
 enable_occ: &enable_occ false  # 设为 true 启用 Occ 监督功能
 
 model_cfg:
@@ -45,7 +41,7 @@ model_cfg:
   voxel_y_range: [-40.0, 40.0]
   voxel_z_range: [-1.0, 5.4]
   voxel_feature_dim: 256
-  voxel_gaussians_per_voxel: 8
+  voxel_gaussians_per_voxel: 4
 
   save_image_duration: 100
   save_val_visualizations: true
@@ -55,8 +51,8 @@ model_cfg:
 
   # Loss weights (Gaussian + Norm)
   lambda_gaussian: 2
-  lambda_scale: 0.0005 
-  lambda_opacity: 0.001
+  lambda_scale: 0.01
+  lambda_opacity: 0.01
   lambda_edge: 0.01
   lambda_depth: 0.01
   enable_depth_supervision: true
@@ -72,6 +68,20 @@ model_cfg:
   sam2_checkpoint: 'checkpoints/sam2.1_hiera_small.pt'
   sam2_model_cfg: 'configs/sam2.1/sam2.1_hiera_s.yaml'
   sam2_dir: null
+
+  recondrive_ckpt: 'work_dirs/recondrive_stage1_gtvoxel_training_occ_densedepth/ckpt/epoch_epoch=29.ckpt'
+  batch_size: 2
+
+vae_cfg:
+  base_channel: 64
+  latent_channels: 64
+  expansion: 8
+  ch_mult: [1, 2, 4, 8]
+  num_res_blocks: 2
+  attn_resolutions: [50]
+  dropout: 0.0
+  kl_weight: 0.00005
+  empty_weight: 0.1
 
 data_cfg:
   dataset_type: '3d'
@@ -100,4 +110,11 @@ data_cfg:
   data_shuffle: True
   drop_last: False
   num_workers: 4
-  num_epochs: 10
+
+train_cfg:
+  max_epochs: 50
+  lr: 1.0e-4
+  weight_decay: 0.01
+  log_every_n_steps: 50
+  save_every_epochs: 1
+  vis_interval: 1

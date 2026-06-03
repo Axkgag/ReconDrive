@@ -624,11 +624,31 @@ class ReconDriveVoxelModel(torch.nn.Module):
 
         self.track_head = None
 
+        K = gaussians_per_voxel
+        bias = torch.randn(K, 3)
+        bias = F.normalize(bias, dim=-1)
+        self.register_buffer('voxel_anchor_bias', bias)
+
+        self.print_gaussian_params = True
+
     def forward(self, images, intrinsics, extrinsics, depth_maps_override=None):
         """
-        images: [B, V, 3, H, W]
+        images:     [B, V, 3, H, W]
         intrinsics: [B, V, 4, 4] or [B, V, 3, 3]
-        extrinsics: [B, V, 4, 4] (camera-to-ego)
+        extrinsics: [B, V, 4, 4]  camera-to-ego
+
+        Returns a dict with per-voxel Gaussians already in ego space.
+        All Gaussian attributes are padded to the same length across the batch.
+
+        Keys:
+            depth_maps:    [B, V, H, W, 1]   — depth head prediction
+            forward_flow:  [B, V, H, W, 3]
+            xyz:           [B, N_max, K, 3]   — voxel-centre + offset, ego coords
+            rot_maps:      [B, N_max*K, 4]
+            scale_maps:    [B, N_max*K, 3]
+            opacity_maps:  [B, N_max*K, 1]
+            sh_maps:       [B, N_max*K, d_sh, 3]
+            voxel_mask:    [B, N_max]          — True for valid (non-padded) voxels
         """
         with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
             aggregated_tokens_list, patch_start_idx = self.aggregator(images.to(torch.bfloat16))
@@ -646,7 +666,7 @@ class ReconDriveVoxelModel(torch.nn.Module):
             if depth_maps_for_voxel.dim() == 5 and depth_maps_for_voxel.shape[-1] == 1:
                 depth_maps_for_voxel = depth_maps_for_voxel[..., 0]
 
-            raw_gaussian = self.gs_head(
+            voxel_out = self.gs_head(
                 aggregated_tokens_list,
                 images=images,
                 patch_start_idx=patch_start_idx,
@@ -655,42 +675,271 @@ class ReconDriveVoxelModel(torch.nn.Module):
                 extrinsics=extrinsics,
             )
 
-            offset_maps, rot_maps, scale_maps, opacity_maps, sh_maps = raw_gaussian.split(
+            b = images.shape[0]
+            v = images.shape[1]
+            device = images.device
+            dtype = depth_maps.dtype
+            K = self.gs_head.gaussians_per_voxel
+
+            if voxel_out["voxel_params"] is None:
+                # 无有效 voxel，返回空占位
+                forward_flow = torch.zeros(b, v, depth_maps.shape[2], depth_maps.shape[3], 3,
+                                           dtype=dtype, device=device)
+                empty = torch.zeros(b, 0, device=device, dtype=dtype)
+                return {
+                    "depth_maps": depth_maps,
+                    "forward_flow": forward_flow,
+                    "xyz": torch.zeros(b, 0, K, 3, device=device, dtype=dtype),
+                    "rot_maps": torch.zeros(b, 0, 4, device=device, dtype=dtype),
+                    "scale_maps": torch.zeros(b, 0, 3, device=device, dtype=dtype),
+                    "opacity_maps": torch.zeros(b, 0, 1, device=device, dtype=dtype),
+                    "sh_maps": torch.zeros(b, 0, self.d_sh, 3, device=device, dtype=dtype),
+                    "voxel_mask": torch.zeros(b, 0, device=device, dtype=torch.bool),
+                }
+
+            voxel_params  = voxel_out["voxel_params"]   # [N_total, K, raw_gs_dim]
+            unique_coords = voxel_out["unique_coords"]   # [N_total, 4]
+            voxel_centers = voxel_out["voxel_centers"]   # [N_total, 3]
+
+            # 激活函数处理
+            offset, rot, scale, opacity, sh_raw = voxel_params.split(
                 (3, 4, 3, 1, 3 * self.d_sh), dim=-1
-            )
+            )  # 每个 [N_total, K, dim]
 
-            offset_maps = torch.tanh(offset_maps) * (self.voxel_size * 0.5)
-            rot_maps = rot_maps / (rot_maps.norm(dim=-1, keepdim=True) + 1e-8)
-            scale_maps = nn.functional.softplus(scale_maps, beta=1) * 0.01
-            opacity_maps = nn.functional.sigmoid(opacity_maps)
+            N_total, K, _ = offset.shape
+            voxel_size_val = offset.new_tensor(self.voxel_size)
+            learned_offset = torch.tanh(offset) * (voxel_size_val * 0.5)
+            base_offset = self.voxel_anchor_bias.unsqueeze(0).expand(N_total, -1, -1) * (voxel_size_val * 0.5)
+            offset = base_offset + learned_offset
+            # offset  = torch.tanh(offset) * (self.voxel_size * 0.5)
 
-            if sh_maps.dim() == 6:
-                sh_maps = rearrange(sh_maps, "b n h w k (i c) -> b n h w k i c", i=3)
-            else:
-                sh_maps = rearrange(sh_maps, "b n h w (i c) -> b n h w i c", i=3)
-            sh_maps = sh_maps * self.sh_mask
+            init_factor = self.voxel_size * 0.15
+            scale   = nn.functional.softplus(scale, beta=1) * init_factor
+
+            rot     = rot / (rot.norm(dim=-1, keepdim=True) + 1e-8)
+            opacity = nn.functional.sigmoid(opacity)
+
+            # sh_raw: [N_total, K, 3*d_sh] → [N_total, K, d_sh, 3]
+            sh = sh_raw.view(sh_raw.shape[0], K, self.d_sh, 3)
+            sh = sh * self.sh_mask.view(1, 1, -1, 1)
+
+            # xyz = voxel 中心 + offset，ego 坐标系
+            # voxel_centers: [N_total, 3] → [N_total, 1, 3]
+            xyz = voxel_centers.unsqueeze(1) + offset  # [N_total, K, 3]
+
+
+            if self.print_gaussian_params:
+                with torch.no_grad():
+                    print("-" * 30)
+                    print(f"[DEBUG] Initial Scale Statistics:")
+                    print(f"  Voxel Size Config: {self.voxel_size}")
+                    print(f"  Scale Tensor Shape: {scale.shape}")
+                    print(f"  Min Scale: {scale.min().item():.6f} m")
+                    print(f"  Max Scale: {scale.max().item():.6f} m")
+                    print(f"  Mean Scale: {scale.mean().item():.6f} m")
+                    print(f"  Median Scale: {scale.median().item():.6f} m")
+
+                    visible_ratio = (opacity > 0.05).float().mean().item()
+                    print(f"    OPACITY (Visibility):")
+                    print(f"    Mean Opacity: {opacity.mean().item():.4f}")
+                    print(f"    Visible Ratio (>0.05): {visible_ratio*100:.1f}%")
+                    print("-" * 30)
+                
+                self.print_gaussian_params = False
+
+            # 按 batch 拆分并 pad 到相同长度
+            batch_idx = unique_coords[:, 0].long()
+            counts_per_batch = torch.bincount(batch_idx, minlength=b)  # [B]
+            n_max = int(counts_per_batch.max().item())
+
+            xyz_pad     = torch.zeros(b, n_max, K, 3,        device=device, dtype=dtype)
+            rot_pad     = torch.zeros(b, n_max * K, 4,       device=device, dtype=dtype)
+            scale_pad   = torch.zeros(b, n_max * K, 3,       device=device, dtype=dtype)
+            opacity_pad = torch.zeros(b, n_max * K, 1,       device=device, dtype=dtype)
+            sh_pad      = torch.zeros(b, n_max * K, self.d_sh, 3, device=device, dtype=dtype)
+            voxel_mask  = torch.zeros(b, n_max,               device=device, dtype=torch.bool)
+
+            for bi in range(b):
+                sel = (batch_idx == bi).nonzero(as_tuple=False).squeeze(-1)
+                n = sel.shape[0]
+                if n == 0:
+                    continue
+                xyz_pad[bi, :n]              = xyz[sel]           # [n, K, 3]
+                rot_pad[bi, :n * K]          = rot[sel].reshape(n * K, 4)
+                scale_pad[bi, :n * K]        = scale[sel].reshape(n * K, 3)
+                opacity_pad[bi, :n * K]      = opacity[sel].reshape(n * K, 1)
+                sh_pad[bi, :n * K]           = sh[sel].reshape(n * K, self.d_sh, 3)
+                voxel_mask[bi, :n]           = True
 
             if self.track_head is not None:
                 forward_flow = self.track_head(
-                    aggregated_tokens_list,
-                    images,
-                    patch_start_idx=patch_start_idx,
-                    motion_tokens=None,
+                    aggregated_tokens_list, images,
+                    patch_start_idx=patch_start_idx, motion_tokens=None,
                 )
             else:
-                b, v, h, w, _ = depth_maps.shape
-                forward_flow = torch.zeros(b, v, h, w, 3, dtype=depth_maps.dtype, device=depth_maps.device)
+                h_d, w_d = depth_maps.shape[2], depth_maps.shape[3]
+                forward_flow = torch.zeros(b, v, h_d, w_d, 3, dtype=dtype, device=device)
 
-        ret_dict = {
-            "depth_maps": depth_maps,
-            "rot_maps": rot_maps,
-            "scale_maps": scale_maps,
-            "opacity_maps": opacity_maps,
-            "sh_maps": sh_maps,
+        return {
+            "depth_maps":   depth_maps,
             "forward_flow": forward_flow,
-            "offset_maps": offset_maps,
+            "xyz":          xyz_pad,       # [B, N_max, K, 3]
+            "rot_maps":     rot_pad,       # [B, N_max*K, 4]
+            "scale_maps":   scale_pad,     # [B, N_max*K, 3]
+            "opacity_maps": opacity_pad,   # [B, N_max*K, 1]
+            "sh_maps":      sh_pad,        # [B, N_max*K, d_sh, 3]
+            "voxel_mask":   voxel_mask,    # [B, N_max]
         }
-        return ret_dict
+
+
+    def get_sparse_voxel_feats(self, images, intrinsics, extrinsics, depth_maps_override=None):
+        with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
+            aggregated_tokens_list, patch_start_idx = self.aggregator(images.to(torch.bfloat16))
+
+        with torch.amp.autocast("cuda", enabled=False):
+            depth_maps, depth_conf = self.depth_head(
+                aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx
+            )
+
+            depth_maps = torch.nn.functional.sigmoid(torch.log(depth_maps))
+            depth_range = self.max_depth - self.min_depth
+            depth_maps = self.min_depth + depth_range * depth_maps
+
+            depth_maps_for_voxel = depth_maps_override if depth_maps_override is not None else depth_maps
+            if depth_maps_for_voxel.dim() == 5 and depth_maps_for_voxel.shape[-1] == 1:
+                depth_maps_for_voxel = depth_maps_for_voxel[..., 0]
+
+            voxel_feats, unique_coords, _, _, depth, shape, num_voxels = self.gs_head.extract_voxel_features(
+                aggregated_tokens_list=aggregated_tokens_list,
+                images=images,
+                patch_start_idx=patch_start_idx,
+                depth_maps=depth_maps,
+                intrinsics=intrinsics,
+                extrinsics=extrinsics,
+            )
+
+        return voxel_feats, unique_coords, depth, shape, num_voxels
+
+
+    def recontrast_voxel_out(self, voxel_out, images, depth_maps):
+        b = images.shape[0]
+        v = images.shape[1]
+        device = images.device
+        dtype = depth_maps.dtype
+        K = self.gs_head.gaussians_per_voxel
+
+        if voxel_out["voxel_params"] is None:
+            # 无有效 voxel，返回空占位
+            forward_flow = torch.zeros(b, v, depth_maps.shape[2], depth_maps.shape[3], 3,
+                                        dtype=dtype, device=device)
+            empty = torch.zeros(b, 0, device=device, dtype=dtype)
+            return {
+                "depth_maps": depth_maps,
+                "forward_flow": forward_flow,
+                "xyz": torch.zeros(b, 0, K, 3, device=device, dtype=dtype),
+                "rot_maps": torch.zeros(b, 0, 4, device=device, dtype=dtype),
+                "scale_maps": torch.zeros(b, 0, 3, device=device, dtype=dtype),
+                "opacity_maps": torch.zeros(b, 0, 1, device=device, dtype=dtype),
+                "sh_maps": torch.zeros(b, 0, self.d_sh, 3, device=device, dtype=dtype),
+                "voxel_mask": torch.zeros(b, 0, device=device, dtype=torch.bool),
+            }
+
+        voxel_params  = voxel_out["voxel_params"]   # [N_total, K, raw_gs_dim]
+        unique_coords = voxel_out["unique_coords"]   # [N_total, 4]
+        voxel_centers = voxel_out["voxel_centers"]   # [N_total, 3]
+
+        # 激活函数处理
+        offset, rot, scale, opacity, sh_raw = voxel_params.split(
+            (3, 4, 3, 1, 3 * self.d_sh), dim=-1
+        )  # 每个 [N_total, K, dim]
+
+        N_total, K, _ = offset.shape
+        voxel_size_val = offset.new_tensor(self.voxel_size)
+        learned_offset = torch.tanh(offset) * (voxel_size_val * 0.5)
+        base_offset = self.voxel_anchor_bias.unsqueeze(0).expand(N_total, -1, -1) * (voxel_size_val * 0.5)
+        offset = base_offset + learned_offset
+        # offset  = torch.tanh(offset) * (self.voxel_size * 0.5)
+
+        init_factor = self.voxel_size * 0.15
+        scale   = nn.functional.softplus(scale, beta=1) * init_factor
+
+        rot     = rot / (rot.norm(dim=-1, keepdim=True) + 1e-8)
+        opacity = nn.functional.sigmoid(opacity)
+
+        # sh_raw: [N_total, K, 3*d_sh] → [N_total, K, d_sh, 3]
+        sh = sh_raw.view(sh_raw.shape[0], K, self.d_sh, 3)
+        sh = sh * self.sh_mask.view(1, 1, -1, 1)
+
+        # xyz = voxel 中心 + offset，ego 坐标系
+        # voxel_centers: [N_total, 3] → [N_total, 1, 3]
+        xyz = voxel_centers.unsqueeze(1) + offset  # [N_total, K, 3]
+
+
+        if self.print_gaussian_params:
+            with torch.no_grad():
+                print("-" * 30)
+                print(f"[DEBUG] Initial Scale Statistics:")
+                print(f"  Voxel Size Config: {self.voxel_size}")
+                print(f"  Scale Tensor Shape: {scale.shape}")
+                print(f"  Min Scale: {scale.min().item():.6f} m")
+                print(f"  Max Scale: {scale.max().item():.6f} m")
+                print(f"  Mean Scale: {scale.mean().item():.6f} m")
+                print(f"  Median Scale: {scale.median().item():.6f} m")
+
+                visible_ratio = (opacity > 0.05).float().mean().item()
+                print(f"    OPACITY (Visibility):")
+                print(f"    Mean Opacity: {opacity.mean().item():.4f}")
+                print(f"    Visible Ratio (>0.05): {visible_ratio*100:.1f}%")
+                print("-" * 30)
+            
+            self.print_gaussian_params = False
+
+        # 按 batch 拆分并 pad 到相同长度
+        batch_idx = unique_coords[:, 0].long()
+        counts_per_batch = torch.bincount(batch_idx, minlength=b)  # [B]
+        n_max = int(counts_per_batch.max().item())
+
+        xyz_pad     = torch.zeros(b, n_max, K, 3,        device=device, dtype=dtype)
+        rot_pad     = torch.zeros(b, n_max * K, 4,       device=device, dtype=dtype)
+        scale_pad   = torch.zeros(b, n_max * K, 3,       device=device, dtype=dtype)
+        opacity_pad = torch.zeros(b, n_max * K, 1,       device=device, dtype=dtype)
+        sh_pad      = torch.zeros(b, n_max * K, self.d_sh, 3, device=device, dtype=dtype)
+        voxel_mask  = torch.zeros(b, n_max,               device=device, dtype=torch.bool)
+
+        for bi in range(b):
+            sel = (batch_idx == bi).nonzero(as_tuple=False).squeeze(-1)
+            n = sel.shape[0]
+            if n == 0:
+                continue
+            xyz_pad[bi, :n]              = xyz[sel]           # [n, K, 3]
+            rot_pad[bi, :n * K]          = rot[sel].reshape(n * K, 4)
+            scale_pad[bi, :n * K]        = scale[sel].reshape(n * K, 3)
+            opacity_pad[bi, :n * K]      = opacity[sel].reshape(n * K, 1)
+            sh_pad[bi, :n * K]           = sh[sel].reshape(n * K, self.d_sh, 3)
+            voxel_mask[bi, :n]           = True
+
+        # if self.track_head is not None:
+        #     forward_flow = self.track_head(
+        #         aggregated_tokens_list, images,
+        #         patch_start_idx=patch_start_idx, motion_tokens=None,
+        #     )
+        # else:
+        #     h_d, w_d = depth_maps.shape[2], depth_maps.shape[3]
+        #     forward_flow = torch.zeros(b, v, h_d, w_d, 3, dtype=dtype, device=device)
+
+        h_d, w_d = depth_maps.shape[2], depth_maps.shape[3]
+        forward_flow = torch.zeros(b, v, h_d, w_d, 3, dtype=dtype, device=device)
+
+        return {
+            "depth_maps":   depth_maps,
+            "forward_flow": forward_flow,
+            "xyz":          xyz_pad,       # [B, N_max, K, 3]
+            "rot_maps":     rot_pad,       # [B, N_max*K, 4]
+            "scale_maps":   scale_pad,     # [B, N_max*K, 3]
+            "opacity_maps": opacity_pad,   # [B, N_max*K, 1]
+            "sh_maps":      sh_pad,        # [B, N_max*K, d_sh, 3]
+            "voxel_mask":   voxel_mask,    # [B, N_max]
+        }
 
 
 class ReconDrive_LITModelModule(pl.LightningModule):
@@ -1571,8 +1820,8 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
         # 6 -> 18
         # [4, 6, 280, 518, 1], [4, 6, 280, 518, 4], [4, 6, 280, 518, 3], [4, 6, 280, 518, 1], [4, 6, 280, 518, 3, 25], [4, 6, 280, 518, 3]
-        offset_maps = None
-        if getattr(self, 'model_variant', 'standard') == 'voxel':
+        is_voxel = (getattr(self, 'model_variant', 'standard') == 'voxel')
+        if is_voxel:
             depth_override = None
             voxel_depth_source = getattr(self, 'voxel_depth_source', 'pred')
             if voxel_depth_source == 'gt':
@@ -1589,88 +1838,121 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         else:
             model_out = self.model(image_list)
 
-        if isinstance(model_out, dict):
-            depth_maps = model_out['depth_maps']
-            rot_maps = model_out['rot_maps']
-            scale_maps = model_out['scale_maps']
-            opacity_maps = model_out['opacity_maps']
-            sh_maps = model_out['sh_maps']
-            forward_flow = model_out['forward_flow']
-            offset_maps = model_out.get('offset_maps', None)
-        else:
-            depth_maps, rot_maps, scale_maps, opacity_maps, sh_maps, forward_flow = model_out
-            offset_maps = None
+        # ── 解析 model 输出 ──────────────────────────────────────────────────
+        depth_maps    = model_out['depth_maps']
+        forward_flow  = model_out['forward_flow']
+
         if self.enable_nan_checks:
             self._check_finite(depth_maps, "depth_maps")
-            self._check_finite(rot_maps, "rot_maps")
-            self._check_finite(scale_maps, "scale_maps")
-            self._check_finite(opacity_maps, "opacity_maps")
-            self._check_finite(sh_maps, "sh_maps")
             self._check_finite(forward_flow, "forward_flow")
-            self._check_finite(offset_maps, "offset_maps")
+
         del image_list
-        batch_size = depth_maps.shape[0]
+        batch_size   = depth_maps.shape[0]
         frame_camrea = depth_maps.shape[1]
 
-        c2e_extr_list = torch.stack(c2e_extr_list, dim=1) # b, s, 4, 4
+        c2e_extr_list = torch.stack(c2e_extr_list, dim=1)  # [B, S, 4, 4]
+        bfc_depth_maps = rearrange(depth_maps.squeeze(-1), 'b c h w -> (b c) h w')
+        bfc_K   = rearrange(inputs['K'],       'b c i j -> (b c) i j')
+        bfc_c2e = rearrange(c2e_extr_list,     'b c i j -> (b c) i j')
 
-        bfc_depth_maps = rearrange(depth_maps.squeeze(-1), 'b c h w -> (b c) h w ')
-        bfc_K = rearrange(inputs['K'], 'b c i j -> (b c) i j ')
-        bfc_c2e = rearrange(c2e_extr_list, 'b c i j -> (b c) i j ')
-
-        # bfc_xyz = self._unproject_depth_map_to_points_map(bfc_depth_maps, bfc_K, bfc_c2e)
-        bf_e2c = torch.linalg.inv(bfc_c2e)
-        bfc_xyz = depth2pc(bfc_depth_maps, bf_e2c, bfc_K)
-
-        gaussians_per_voxel = rot_maps.shape[-2] if rot_maps.dim() == 6 else 1
-        if offset_maps is not None and offset_maps.dim() == 6:
-            bfc_offset = rearrange(offset_maps, 'b c h w k d -> (b c) (h w) k d')
-            bfc_xyz = bfc_xyz.unsqueeze(2) + bfc_offset
-            bfc_xyz = bfc_xyz.reshape(bfc_xyz.shape[0], -1, 3)
-        else:
-            if offset_maps is not None:
-                bfc_offset = rearrange(offset_maps, 'b c h w d -> (b c) (h w) d')
-                bfc_xyz = bfc_xyz + bfc_offset
-            if gaussians_per_voxel > 1:
-                bfc_xyz = bfc_xyz.unsqueeze(2).expand(-1, -1, gaussians_per_voxel, -1)
-                bfc_xyz = bfc_xyz.reshape(bfc_xyz.shape[0], -1, 3)
-        if self.enable_nan_checks:
-            self._check_finite(bfc_xyz, "bfc_xyz")
-
-        if sh_maps.dim() == 7:
-            bfc_sh = rearrange(sh_maps, 'b c h w k p d -> (b c) h w k p d')
-            c2w_rotations = rearrange(bfc_c2e[:, :3, :3], "b i j -> b () () () () i j")
-            bfc_sh = rotate_sh(bfc_sh, c2w_rotations)
-        else:
-            bfc_sh = rearrange(sh_maps, 'b c h w p d -> (b c) h w p d')
-            c2w_rotations = rearrange(bfc_c2e[:, :3, :3], "b i j -> b () () () i j")
-            bfc_sh = rotate_sh(bfc_sh, c2w_rotations)
-        if self.enable_nan_checks:
-            self._check_finite(bfc_sh, "bfc_sh")
-
-        # Transform rot_maps from camera frame to ego frame
-        # rot_maps shape: [batch, num_cams, h, w, 4]
-        # bfc_c2e shape: [(batch*num_cams), 4, 4]
-        if rot_maps.dim() == 6:
-            bfc_rot_maps = rearrange(rot_maps, 'b c h w k d -> (b c) (h w k) d', d=4)
-        else:
-            bfc_rot_maps = rearrange(rot_maps, 'b c h w d -> (b c) (h w) d', d=4)
-
-        outputs['pred_depths'] = rearrange(bfc_depth_maps, '(b c) h w -> b (c h w)', b=batch_size, c=frame_camrea)#.contiguous()
-        # Keep depth-head prediction in map format for direct dense depth supervision.
+        outputs['pred_depths']     = rearrange(bfc_depth_maps, '(b c) h w -> b (c h w)',
+                                               b=batch_size, c=frame_camrea)
         outputs['pred_depth_maps'] = depth_maps.squeeze(-1)
 
-        outputs['xyz'] = rearrange(bfc_xyz, '(b c) p k -> b (c p) k', b=batch_size, c=frame_camrea)#.contiguous()
-        outputs['rot_maps'] = rearrange(bfc_rot_maps, '(b c) p d -> b (c p) d', b=batch_size, c=frame_camrea, d=4)#.contiguous()
+        if is_voxel:
+            # ── Voxel head 专用路径 ──────────────────────────────────────────
+            # xyz 已是 ego 坐标系（voxel中心 + offset），SH 已在 ego 系，无需 rotate
+            xyz_vox      = model_out['xyz']          # [B, N_max, K, 3]
+            rot_vox      = model_out['rot_maps']      # [B, N_max*K, 4]
+            scale_vox    = model_out['scale_maps']    # [B, N_max*K, 3]
+            opacity_vox  = model_out['opacity_maps']  # [B, N_max*K, 1]
+            sh_vox       = model_out['sh_maps']       # [B, N_max*K, d_sh, 3]
+            voxel_mask   = model_out['voxel_mask']    # [B, N_max]
 
-        if scale_maps.dim() == 6:
-            outputs['scale_maps'] = rearrange(scale_maps, 'b c h w k d -> b (c h w k) d', d=3)#.contiguous()
-            outputs['opacity_maps'] = rearrange(opacity_maps, 'b c h w k d -> b (c h w k) d')#.contiguous()
-            outputs['sh_maps'] = rearrange(bfc_sh, '(b c) h w k p d -> b (c h w k) d p', b=batch_size, c=frame_camrea)#.contiguous()
+            if self.enable_nan_checks:
+                self._check_finite(xyz_vox,     "xyz_vox")
+                self._check_finite(rot_vox,     "rot_vox")
+                self._check_finite(scale_vox,   "scale_vox")
+                self._check_finite(opacity_vox, "opacity_vox")
+                self._check_finite(sh_vox,      "sh_vox")
+
+            K = xyz_vox.shape[2]
+            # xyz: [B, N_max, K, 3] → [B, N_max*K, 3]
+            outputs['xyz']          = xyz_vox.reshape(batch_size, -1, 3)
+            outputs['rot_maps']     = rot_vox
+            outputs['scale_maps']   = scale_vox
+            outputs['opacity_maps'] = opacity_vox
+            # sh_vox: [B, N_max*K, d_sh, 3]，rasterization 期望 [N, d_sh, 3]，直接存储
+            outputs['sh_maps']      = sh_vox
+            outputs['voxel_mask']   = voxel_mask
+            outputs['ae_global_points'] = True  # 高斯是全场景共享的，渲染时不按相机分割
+
+            gaussians_per_voxel = K
+
         else:
-            outputs['scale_maps'] = rearrange(scale_maps, 'b c h w d -> b (c h w) d', d=3)#.contiguous()
-            outputs['opacity_maps'] = rearrange(opacity_maps, 'b c h w d -> b (c h w) d')#.contiguous()
-            outputs['sh_maps'] = rearrange(bfc_sh, '(b c) h w p d -> b (c h w) d p', b=batch_size, c=frame_camrea)#.contiguous()
+            # ── 标准 DPT head 路径（per-pixel Gaussians）────────────────────
+            rot_maps    = model_out['rot_maps']
+            scale_maps  = model_out['scale_maps']
+            opacity_maps = model_out['opacity_maps']
+            sh_maps     = model_out['sh_maps']
+            offset_maps = model_out.get('offset_maps', None)
+
+            if self.enable_nan_checks:
+                self._check_finite(rot_maps,     "rot_maps")
+                self._check_finite(scale_maps,   "scale_maps")
+                self._check_finite(opacity_maps, "opacity_maps")
+                self._check_finite(sh_maps,      "sh_maps")
+                self._check_finite(offset_maps,  "offset_maps")
+
+            bf_e2c = torch.linalg.inv(bfc_c2e)
+            bfc_xyz = depth2pc(bfc_depth_maps, bf_e2c, bfc_K)
+
+            gaussians_per_voxel = rot_maps.shape[-2] if rot_maps.dim() == 6 else 1
+            if offset_maps is not None and offset_maps.dim() == 6:
+                bfc_offset = rearrange(offset_maps, 'b c h w k d -> (b c) (h w) k d')
+                bfc_xyz = bfc_xyz.unsqueeze(2) + bfc_offset
+                bfc_xyz = bfc_xyz.reshape(bfc_xyz.shape[0], -1, 3)
+            else:
+                if offset_maps is not None:
+                    bfc_offset = rearrange(offset_maps, 'b c h w d -> (b c) (h w) d')
+                    bfc_xyz = bfc_xyz + bfc_offset
+                if gaussians_per_voxel > 1:
+                    bfc_xyz = bfc_xyz.unsqueeze(2).expand(-1, -1, gaussians_per_voxel, -1)
+                    bfc_xyz = bfc_xyz.reshape(bfc_xyz.shape[0], -1, 3)
+            if self.enable_nan_checks:
+                self._check_finite(bfc_xyz, "bfc_xyz")
+
+            if sh_maps.dim() == 7:
+                bfc_sh = rearrange(sh_maps, 'b c h w k p d -> (b c) h w k p d')
+                c2w_rotations = rearrange(bfc_c2e[:, :3, :3], "b i j -> b () () () () i j")
+                bfc_sh = rotate_sh(bfc_sh, c2w_rotations)
+            else:
+                bfc_sh = rearrange(sh_maps, 'b c h w p d -> (b c) h w p d')
+                c2w_rotations = rearrange(bfc_c2e[:, :3, :3], "b i j -> b () () () i j")
+                bfc_sh = rotate_sh(bfc_sh, c2w_rotations)
+            if self.enable_nan_checks:
+                self._check_finite(bfc_sh, "bfc_sh")
+
+            if rot_maps.dim() == 6:
+                bfc_rot_maps = rearrange(rot_maps, 'b c h w k d -> (b c) (h w k) d', d=4)
+            else:
+                bfc_rot_maps = rearrange(rot_maps, 'b c h w d -> (b c) (h w) d', d=4)
+
+            outputs['xyz']      = rearrange(bfc_xyz, '(b c) p k -> b (c p) k',
+                                            b=batch_size, c=frame_camrea)
+            outputs['rot_maps'] = rearrange(bfc_rot_maps, '(b c) p d -> b (c p) d',
+                                            b=batch_size, c=frame_camrea, d=4)
+
+            if scale_maps.dim() == 6:
+                outputs['scale_maps']   = rearrange(scale_maps,   'b c h w k d -> b (c h w k) d', d=3)
+                outputs['opacity_maps'] = rearrange(opacity_maps, 'b c h w k d -> b (c h w k) d')
+                outputs['sh_maps']      = rearrange(bfc_sh, '(b c) h w k p d -> b (c h w k) d p',
+                                                    b=batch_size, c=frame_camrea)
+            else:
+                outputs['scale_maps']   = rearrange(scale_maps,   'b c h w d -> b (c h w) d', d=3)
+                outputs['opacity_maps'] = rearrange(opacity_maps, 'b c h w d -> b (c h w) d')
+                outputs['sh_maps']      = rearrange(bfc_sh, '(b c) h w p d -> b (c h w) d p',
+                                                    b=batch_size, c=frame_camrea)
 
         # Generate vehicle-based 3D velocity flow
         if self.use_vehicle_flow:
@@ -1773,11 +2055,13 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                     all_vehicle_masks.append(empty_masks)
 
             flow_tensor = torch.stack(new_forward_flow)
-            if gaussians_per_voxel > 1:
+            if not is_voxel and gaussians_per_voxel > 1:
                 flow_tensor = flow_tensor.unsqueeze(4).expand(-1, -1, -1, -1, gaussians_per_voxel, -1)
                 outputs['forward_flow'] = rearrange(flow_tensor, 'b c h w k d -> b (c h w k) d')
-            else:
+            elif not is_voxel:
                 outputs['forward_flow'] = rearrange(flow_tensor, 'b c h w d -> b (c h w) d')
+            else:
+                outputs['forward_flow'] = flow_tensor
             # Store vehicle masks as tensor for unified format [b, c, h, w]
             if len(all_vehicle_masks) > 0:
                 outputs['vehicle_masks'] = torch.stack(all_vehicle_masks)
@@ -1786,11 +2070,14 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
         else:
             # Use original flow from model
-            if gaussians_per_voxel > 1:
+            if is_voxel:
+                # voxel 路径：forward_flow 是 [B, V, H, W, 3]，保持原格式供 loss 使用
+                outputs['forward_flow'] = forward_flow
+            elif gaussians_per_voxel > 1:
                 flow_tensor = forward_flow.unsqueeze(4).expand(-1, -1, -1, -1, gaussians_per_voxel, -1)
                 outputs['forward_flow'] = rearrange(flow_tensor, 'b c h w k d -> b (c h w k) d')
             else:
-                outputs['forward_flow'] = rearrange(forward_flow, 'b c h w d -> b (c h w) d')#.contiguous()
+                outputs['forward_flow'] = rearrange(forward_flow, 'b c h w d -> b (c h w) d')
             outputs['vehicle_masks'] = None  # No vehicle masks when not using vehicle flow
 
         # Perform ICP refinement early if we have multiple frames (needed for ego pose and velocity refinement)
@@ -1940,7 +2227,9 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             outputs['rot_maps_transformed'] = outputs['rot_maps']
             outputs['sh_maps_transformed'] = outputs['sh_maps']
 
-        del bfc_K, bfc_c2e, bfc_depth_maps, bfc_xyz, rot_maps, scale_maps, opacity_maps, bfc_sh,
+        del bfc_K, bfc_c2e, bfc_depth_maps
+        if not is_voxel:
+            del bfc_xyz, rot_maps, scale_maps, opacity_maps, bfc_sh
         return outputs
 
     def get_render_data(self, data_dict):

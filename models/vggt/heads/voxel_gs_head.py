@@ -69,7 +69,9 @@ class VGGT_Voxel_GS_Head(nn.Module):
         self.y_range = y_range
         self.z_range = z_range
         self.gaussians_per_voxel = gaussians_per_voxel
+        self.feature_dim = feature_dim
 
+        self.sh_degree = sh_degree
         self.d_sh = (sh_degree + 1) ** 2
         self.raw_gs_dim = 3 + 4 + 3 + 1 + 3 * self.d_sh  # offset + rot + scale + opacity + SH
         self.opacity_index = 3 + 4 + 3
@@ -84,6 +86,7 @@ class VGGT_Voxel_GS_Head(nn.Module):
             feature_only=True,
         )
 
+        self.feat_agg_proj = nn.Linear(feature_dim * 3, feature_dim, bias=False)
         self.refiner = VoxelFeatureRefiner()
         self.decoder = nn.Sequential(
             nn.Linear(feature_dim, feature_dim),
@@ -99,8 +102,19 @@ class VGGT_Voxel_GS_Head(nn.Module):
         depth_maps: torch.Tensor,
         intrinsics: torch.Tensor,
         extrinsics: torch.Tensor,
-    ) -> torch.Tensor:
-        voxel_feats, unique_coords, inv, valid_idx, depth, shape, num_voxels = self.extract_voxel_features(
+    ) -> dict:
+        """
+        Returns a dict with per-voxel Gaussians in ego (world) space.
+
+        Keys:
+            voxel_params:   [num_voxels, K, raw_gs_dim]  — raw Gaussian params per voxel
+            unique_coords:  [num_voxels, 4]              — (batch_idx, vx, vy, vz)
+            voxel_centers:  [num_voxels, 3]              — voxel center in ego coords (metres)
+            depth:          [B, S, H, W]
+            shape:          (B, S, H, W)
+        When no valid voxels exist, voxel_params / unique_coords / voxel_centers are None.
+        """
+        voxel_feats, unique_coords, _, _, depth, shape, num_voxels = self.extract_voxel_features(
             aggregated_tokens_list=aggregated_tokens_list,
             images=images,
             patch_start_idx=patch_start_idx,
@@ -109,27 +123,26 @@ class VGGT_Voxel_GS_Head(nn.Module):
             extrinsics=extrinsics,
         )
 
-        if voxel_feats is None:
-            b, s, h, w = shape
-            device = depth.device
-            raw_full = torch.zeros(
-                b * s * h * w, self.gaussians_per_voxel, self.raw_gs_dim, device=device, dtype=depth.dtype
-            )
-            raw_full[:, :, self.opacity_index] = self.invalid_opacity
-            return raw_full.view(b, s, h, w, self.gaussians_per_voxel, self.raw_gs_dim)
-
+        if voxel_feats is None or unique_coords is None:
+            return {
+                "voxel_params": None,
+                "unique_coords": None,
+                "voxel_centers": None,
+                "depth": depth,
+                "shape": shape,
+            }
+        
         voxel_feats = self.refiner(voxel_feats, unique_coords)
         voxel_params = self.decoder(voxel_feats).view(num_voxels, self.gaussians_per_voxel, self.raw_gs_dim)
+        voxel_centers = self._coords_to_world_pos(unique_coords)
 
-        b, s, h, w = shape
-        device = depth.device
-        raw_full = torch.zeros(
-            b * s * h * w, self.gaussians_per_voxel, self.raw_gs_dim, device=device, dtype=depth.dtype
-        )
-        raw_full[:, :, self.opacity_index] = self.invalid_opacity
-        raw_full[valid_idx] = voxel_params[inv]
-        raw_full_reshaped = raw_full.view(b, s, h, w, self.gaussians_per_voxel, self.raw_gs_dim)
-        return raw_full_reshaped
+        return {
+            "voxel_params": voxel_params,
+            "unique_coords": unique_coords,
+            "voxel_centers": voxel_centers,
+            "depth": depth,
+            "shape": shape,
+        }
 
     def extract_voxel_features(
         self,
@@ -176,7 +189,9 @@ class VGGT_Voxel_GS_Head(nn.Module):
         points = depth2pc(depth.view(b * s, h, w), e2c, k)  # [B*S, H*W, 3]
         points_flat = points.reshape(-1, 3)
         feats_flat = features_flat.view(-1, c)
-        batch_ids = torch.arange(b * s, device=device).unsqueeze(1).expand(b * s, h * w).reshape(-1)
+        # Each of the S cameras in a batch sample shares the same batch index,
+        # so all cameras project into the same per-sample voxel grid.
+        batch_ids = torch.arange(b, device=device).unsqueeze(1).expand(b, s * h * w).reshape(-1)
 
         valid_mask = depth_flat.view(-1) > 0
         voxel_coords = torch.floor(
@@ -184,9 +199,7 @@ class VGGT_Voxel_GS_Head(nn.Module):
             / self.voxel_size
         ).long()
 
-        nx = int((self.x_range[1] - self.x_range[0]) / self.voxel_size)
-        ny = int((self.y_range[1] - self.y_range[0]) / self.voxel_size)
-        nz = int((self.z_range[1] - self.z_range[0]) / self.voxel_size)
+        nx, ny, nz = self._voxel_grid_size()
 
         in_range = (
             (voxel_coords[:, 0] >= 0) & (voxel_coords[:, 0] < nx) &
@@ -206,12 +219,47 @@ class VGGT_Voxel_GS_Head(nn.Module):
         unique_coords, inv = torch.unique(coords, dim=0, return_inverse=True)
         num_voxels = unique_coords.shape[0]
 
-        voxel_feats = torch.zeros(num_voxels, c, device=device, dtype=depth.dtype)
-        voxel_feats.scatter_add_(0, inv.unsqueeze(-1).expand(-1, c), feats_flat[valid_idx])
+        feats_valid = feats_flat[valid_idx]
+        inv_exp = inv.unsqueeze(-1).expand(-1, c)
+
         counts = torch.zeros(num_voxels, 1, device=device, dtype=depth.dtype)
         counts.scatter_add_(0, inv.unsqueeze(-1), torch.ones_like(inv, dtype=depth.dtype).unsqueeze(-1))
-        voxel_feats = voxel_feats / counts.clamp_min(1.0)
+
+        voxel_mean = torch.zeros(num_voxels, c, device=device, dtype=depth.dtype)
+        voxel_mean.scatter_add_(0, inv_exp, feats_valid)
+        voxel_mean = voxel_mean / counts.clamp_min(1.0)
+
+        min_val = torch.finfo(feats_valid.dtype).min / 2
+        voxel_max = torch.full((num_voxels, c), min_val, device=device, dtype=depth.dtype)
+        voxel_max.scatter_reduce_(0, inv_exp, feats_valid, reduce='amax', include_self=True)
+
+        diff_sq = (feats_valid - voxel_mean[inv]) ** 2
+        voxel_var = torch.zeros(num_voxels, c, device=device, dtype=depth.dtype)
+        voxel_var.scatter_add_(0, inv_exp, diff_sq)
+        variance = voxel_var / counts.clamp_min(1.0)
+        voxel_std = torch.sqrt(variance.clamp_min(1e-6)) 
+        # voxel_std = (voxel_var / counts.clamp_min(1.0)).sqrt()
+
+        voxel_feats = self.feat_agg_proj(torch.cat([voxel_mean, voxel_max, voxel_std], dim=-1))
         return voxel_feats, unique_coords, inv, valid_idx, depth, (b, s, h, w), num_voxels
+
+    def _coords_to_world_pos(self, coords: torch.Tensor) -> torch.Tensor:
+        """将 voxel 整数坐标转换为 ego 坐标系下的 voxel 中心位置（单位：米）。
+
+        Args:
+            coords: [N, 4]，列顺序为 (batch_idx, vx, vy, vz)
+        Returns:
+            [N, 3]，ego 坐标系下的 xyz（voxel 中心）
+        """
+        origin = coords.new_tensor([self.x_range[0], self.y_range[0], self.z_range[0]])
+        xyz = coords[:, 1:].float() * self.voxel_size + origin + self.voxel_size * 0.5
+        return xyz
+
+    def _voxel_grid_size(self) -> Tuple[int, int, int]:
+        nx = int((self.x_range[1] - self.x_range[0]) / self.voxel_size)
+        ny = int((self.y_range[1] - self.y_range[0]) / self.voxel_size)
+        nz = int((self.z_range[1] - self.z_range[0]) / self.voxel_size)
+        return nx, ny, nz
 
     @staticmethod
     def _ensure_4x4(matrix: torch.Tensor, device: torch.device, dtype: torch.dtype) -> torch.Tensor:

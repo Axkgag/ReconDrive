@@ -13,6 +13,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from PIL import Image
 from models.recondrive_model import ReconDrive_LITModelModule
+from einops import rearrange, reduce
+from models.gaussian_util import render, focal2fov, getProjectionMatrix,  depth2pc, pc2depth, rotate_sh, quat_multiply
 
 
 class ReconDriveStage1_LITModelModule(ReconDrive_LITModelModule):
@@ -626,3 +628,435 @@ class ReconDriveStage1_LITModelModule(ReconDrive_LITModelModule):
         fig.savefig(save_path, bbox_inches='tight', dpi=150)
         plt.close(fig)
         return
+
+    def get_model_outputs(self, data_dict):
+        inputs = data_dict['context_frames']
+        outputs = {}
+
+        image_list = []
+        c2e_extr_list = []
+
+        for frame_cam_id in range(inputs[('color_aug', 0)].shape[1]):
+            c2e_extr = inputs['c2e_extr'][:, frame_cam_id, ...]
+            image_list.append(inputs[(f'color_aug', 0)][:,frame_cam_id,...])
+            c2e_extr_list.append(c2e_extr)
+        image_list = torch.stack(image_list,dim=1)
+
+        # 6 -> 18
+        # [4, 6, 280, 518, 1], [4, 6, 280, 518, 4], [4, 6, 280, 518, 3], [4, 6, 280, 518, 1], [4, 6, 280, 518, 3, 25], [4, 6, 280, 518, 3]
+        is_voxel = (getattr(self, 'model_variant', 'standard') == 'voxel')
+        if is_voxel:
+            depth_override = None
+            voxel_depth_source = getattr(self, 'voxel_depth_source', 'pred')
+            if voxel_depth_source == 'gt':
+                depth_override = self._prepare_voxel_depth_override(
+                    inputs.get('gt_depth', None),
+                    image_list.shape[-2:],
+                    image_list.device,
+                    image_list.dtype,
+                )
+            if depth_override is not None:
+                model_out = self.model(image_list, inputs['K'], inputs['c2e_extr'], depth_maps_override=depth_override)
+            else:
+                model_out = self.model(image_list, inputs['K'], inputs['c2e_extr'])
+        else:
+            model_out = self.model(image_list)
+
+        return model_out, image_list, c2e_extr_list
+
+    def get_recontrast_data_from_modelout(self, data_dict, model_out, c2e_extr_list, batch_idx=0):
+        inputs = data_dict['context_frames']
+        outputs = {}
+
+        depth_maps    = model_out['depth_maps']
+        forward_flow  = model_out['forward_flow']
+
+        if self.enable_nan_checks:
+            self._check_finite(depth_maps, "depth_maps")
+            self._check_finite(forward_flow, "forward_flow")
+
+        batch_size   = depth_maps.shape[0]
+        frame_camrea = depth_maps.shape[1]
+
+        c2e_extr_list = torch.stack(c2e_extr_list, dim=1)  # [B, S, 4, 4]
+        bfc_depth_maps = rearrange(depth_maps.squeeze(-1), 'b c h w -> (b c) h w')
+        bfc_K   = rearrange(inputs['K'],       'b c i j -> (b c) i j')
+        bfc_c2e = rearrange(c2e_extr_list,     'b c i j -> (b c) i j')
+
+        outputs['pred_depths']     = rearrange(bfc_depth_maps, '(b c) h w -> b (c h w)',
+                                               b=batch_size, c=frame_camrea)
+        outputs['pred_depth_maps'] = depth_maps.squeeze(-1)
+
+        is_voxel = (getattr(self, 'model_variant', 'standard') == 'voxel')
+        if is_voxel:
+            # ── Voxel head 专用路径 ──────────────────────────────────────────
+            # xyz 已是 ego 坐标系（voxel中心 + offset），SH 已在 ego 系，无需 rotate
+            xyz_vox      = model_out['xyz']          # [B, N_max, K, 3]
+            rot_vox      = model_out['rot_maps']      # [B, N_max*K, 4]
+            scale_vox    = model_out['scale_maps']    # [B, N_max*K, 3]
+            opacity_vox  = model_out['opacity_maps']  # [B, N_max*K, 1]
+            sh_vox       = model_out['sh_maps']       # [B, N_max*K, d_sh, 3]
+            voxel_mask   = model_out['voxel_mask']    # [B, N_max]
+
+            if self.enable_nan_checks:
+                self._check_finite(xyz_vox,     "xyz_vox")
+                self._check_finite(rot_vox,     "rot_vox")
+                self._check_finite(scale_vox,   "scale_vox")
+                self._check_finite(opacity_vox, "opacity_vox")
+                self._check_finite(sh_vox,      "sh_vox")
+
+            K = xyz_vox.shape[2]
+            # xyz: [B, N_max, K, 3] → [B, N_max*K, 3]
+            outputs['xyz']          = xyz_vox.reshape(batch_size, -1, 3)
+            outputs['rot_maps']     = rot_vox
+            outputs['scale_maps']   = scale_vox
+            outputs['opacity_maps'] = opacity_vox
+            # sh_vox: [B, N_max*K, d_sh, 3]，rasterization 期望 [N, d_sh, 3]，直接存储
+            outputs['sh_maps']      = sh_vox
+            outputs['voxel_mask']   = voxel_mask
+            outputs['ae_global_points'] = True  # 高斯是全场景共享的，渲染时不按相机分割
+
+            gaussians_per_voxel = K
+
+        else:
+            # ── 标准 DPT head 路径（per-pixel Gaussians）────────────────────
+            rot_maps    = model_out['rot_maps']
+            scale_maps  = model_out['scale_maps']
+            opacity_maps = model_out['opacity_maps']
+            sh_maps     = model_out['sh_maps']
+            offset_maps = model_out.get('offset_maps', None)
+
+            if self.enable_nan_checks:
+                self._check_finite(rot_maps,     "rot_maps")
+                self._check_finite(scale_maps,   "scale_maps")
+                self._check_finite(opacity_maps, "opacity_maps")
+                self._check_finite(sh_maps,      "sh_maps")
+                self._check_finite(offset_maps,  "offset_maps")
+
+            bf_e2c = torch.linalg.inv(bfc_c2e)
+            bfc_xyz = depth2pc(bfc_depth_maps, bf_e2c, bfc_K)
+
+            gaussians_per_voxel = rot_maps.shape[-2] if rot_maps.dim() == 6 else 1
+            if offset_maps is not None and offset_maps.dim() == 6:
+                bfc_offset = rearrange(offset_maps, 'b c h w k d -> (b c) (h w) k d')
+                bfc_xyz = bfc_xyz.unsqueeze(2) + bfc_offset
+                bfc_xyz = bfc_xyz.reshape(bfc_xyz.shape[0], -1, 3)
+            else:
+                if offset_maps is not None:
+                    bfc_offset = rearrange(offset_maps, 'b c h w d -> (b c) (h w) d')
+                    bfc_xyz = bfc_xyz + bfc_offset
+                if gaussians_per_voxel > 1:
+                    bfc_xyz = bfc_xyz.unsqueeze(2).expand(-1, -1, gaussians_per_voxel, -1)
+                    bfc_xyz = bfc_xyz.reshape(bfc_xyz.shape[0], -1, 3)
+            if self.enable_nan_checks:
+                self._check_finite(bfc_xyz, "bfc_xyz")
+
+            if sh_maps.dim() == 7:
+                bfc_sh = rearrange(sh_maps, 'b c h w k p d -> (b c) h w k p d')
+                c2w_rotations = rearrange(bfc_c2e[:, :3, :3], "b i j -> b () () () () i j")
+                bfc_sh = rotate_sh(bfc_sh, c2w_rotations)
+            else:
+                bfc_sh = rearrange(sh_maps, 'b c h w p d -> (b c) h w p d')
+                c2w_rotations = rearrange(bfc_c2e[:, :3, :3], "b i j -> b () () () i j")
+                bfc_sh = rotate_sh(bfc_sh, c2w_rotations)
+            if self.enable_nan_checks:
+                self._check_finite(bfc_sh, "bfc_sh")
+
+            if rot_maps.dim() == 6:
+                bfc_rot_maps = rearrange(rot_maps, 'b c h w k d -> (b c) (h w k) d', d=4)
+            else:
+                bfc_rot_maps = rearrange(rot_maps, 'b c h w d -> (b c) (h w) d', d=4)
+
+            outputs['xyz']      = rearrange(bfc_xyz, '(b c) p k -> b (c p) k',
+                                            b=batch_size, c=frame_camrea)
+            outputs['rot_maps'] = rearrange(bfc_rot_maps, '(b c) p d -> b (c p) d',
+                                            b=batch_size, c=frame_camrea, d=4)
+
+            if scale_maps.dim() == 6:
+                outputs['scale_maps']   = rearrange(scale_maps,   'b c h w k d -> b (c h w k) d', d=3)
+                outputs['opacity_maps'] = rearrange(opacity_maps, 'b c h w k d -> b (c h w k) d')
+                outputs['sh_maps']      = rearrange(bfc_sh, '(b c) h w k p d -> b (c h w k) d p',
+                                                    b=batch_size, c=frame_camrea)
+            else:
+                outputs['scale_maps']   = rearrange(scale_maps,   'b c h w d -> b (c h w) d', d=3)
+                outputs['opacity_maps'] = rearrange(opacity_maps, 'b c h w d -> b (c h w) d')
+                outputs['sh_maps']      = rearrange(bfc_sh, '(b c) h w p d -> b (c h w) d p',
+                                                    b=batch_size, c=frame_camrea)
+
+        # Generate vehicle-based 3D velocity flow
+        if self.use_vehicle_flow:
+            new_forward_flow = []
+
+            # ALWAYS compute vehicle masks using SAM2 for correct flow application
+            # The masks are essential for applying velocity to the correct pixels
+            compute_vehicle_masks = True  # Always compute for proper flow
+
+            all_vehicle_masks = []
+
+            for b in range(batch_size):
+                batch_flows = []
+                batch_masks = []  # Always collect masks for unified format
+
+                for c in range(frame_camrea):
+                    # Determine frame index and camera index
+                    frame_idx = c // self.num_cams  # 0 for frame 0, 1 for frame context_span
+                    cam_idx = c % self.num_cams
+
+                    # Get image for segmentation
+                    color_tensor = inputs.get(('color_aug', 0), torch.zeros(batch_size, frame_camrea, 3, self.height, self.width))
+                    seg_img = color_tensor[b, c]
+
+                    # Initialize outputs
+                    vehicle_masks = []
+                    vehicle_velocities = []
+
+                    # Determine which frame-specific annotations to use
+                    if frame_idx == 0:
+                        anno_key = 'vehicle_annotations_frame_0'
+                    else:
+                        anno_key = f'vehicle_annotations_frame_{self.context_span}'
+
+                    # Fallback to combined annotations if frame-specific not available
+                    if anno_key not in inputs and 'vehicle_annotations' in inputs:
+                        anno_key = 'vehicle_annotations'
+                        lookup_idx = c
+                    else:
+                        lookup_idx = cam_idx
+
+                    # Process vehicle annotations if available
+                    if anno_key in inputs and b < len(inputs[anno_key]):
+                        try:
+                            batch_data = inputs[anno_key][b]
+
+                            if lookup_idx < len(batch_data):
+                                vehicle_data = batch_data[lookup_idx]
+
+                                # Extract bounding boxes and velocities
+                                bbox_2d_list = []
+                                raw_velocities = []
+                                vehicle_depths = []
+                                vehicle_intrinsics = []
+
+                                if isinstance(vehicle_data, list):
+                                    for vehicle in vehicle_data:
+                                        if isinstance(vehicle, dict) and 'bbox_2d' in vehicle:
+                                            bbox_2d_list.append(vehicle['bbox_2d'])
+                                            vel = vehicle.get('velocity', [0, 0, 0])
+                                            # Ensure velocity is 3D
+                                            if isinstance(vel, (list, tuple)) and len(vel) > 3:
+                                                vel = vel[:3]
+                                            raw_velocities.append(vel)
+                                            vehicle_depths.append(vehicle.get('depth', 10.0))
+                                            vehicle_intrinsics.append(vehicle.get('camera_intrinsic', None))
+
+                                # Create masks using SAM2
+                                vehicle_masks = self.segment_vehicles_with_sam2(seg_img, bbox_2d_list if bbox_2d_list else None)
+                                vehicle_velocities = raw_velocities
+                        except Exception:
+                            pass  # Skip if annotations not accessible
+
+                    # Ensure we have masks and velocities aligned
+                    if len(vehicle_velocities) < len(vehicle_masks):
+                        vehicle_velocities += [[0.0, 0.0, 0.0]] * (len(vehicle_masks) - len(vehicle_velocities))
+
+                    # Compute 3D velocity flow
+                    flow = self.compute_velocity_flow(
+                        vehicle_masks, 
+                        vehicle_velocities,
+                        (self.height, self.width)
+                    )
+
+                    batch_flows.append(torch.from_numpy(flow).to(depth_maps.device))
+
+                    # Store combined mask for inference (always needed)
+                    combined_mask = np.zeros((self.height, self.width), dtype=bool)
+                    for mask in vehicle_masks:
+                        if mask is not None:
+                            combined_mask |= mask
+                    batch_masks.append(torch.from_numpy(combined_mask).to(depth_maps.device))
+
+                new_forward_flow.append(torch.stack(batch_flows))
+                if len(batch_masks) > 0:
+                    all_vehicle_masks.append(torch.stack(batch_masks))
+                else:
+                    # Create empty masks if no masks were collected
+                    empty_masks = torch.zeros(frame_camrea, self.height, self.width, dtype=torch.bool, device=depth_maps.device)
+                    all_vehicle_masks.append(empty_masks)
+
+            flow_tensor = torch.stack(new_forward_flow)
+            if not is_voxel and gaussians_per_voxel > 1:
+                flow_tensor = flow_tensor.unsqueeze(4).expand(-1, -1, -1, -1, gaussians_per_voxel, -1)
+                outputs['forward_flow'] = rearrange(flow_tensor, 'b c h w k d -> b (c h w k) d')
+            elif not is_voxel:
+                outputs['forward_flow'] = rearrange(flow_tensor, 'b c h w d -> b (c h w) d')
+            else:
+                outputs['forward_flow'] = flow_tensor
+            # Store vehicle masks as tensor for unified format [b, c, h, w]
+            if len(all_vehicle_masks) > 0:
+                outputs['vehicle_masks'] = torch.stack(all_vehicle_masks)
+            else:
+                outputs['vehicle_masks'] = None
+
+        else:
+            # Use original flow from model
+            if is_voxel:
+                # voxel 路径：forward_flow 是 [B, V, H, W, 3]，保持原格式供 loss 使用
+                outputs['forward_flow'] = forward_flow
+            elif gaussians_per_voxel > 1:
+                flow_tensor = forward_flow.unsqueeze(4).expand(-1, -1, -1, -1, gaussians_per_voxel, -1)
+                outputs['forward_flow'] = rearrange(flow_tensor, 'b c h w k d -> b (c h w k) d')
+            else:
+                outputs['forward_flow'] = rearrange(forward_flow, 'b c h w d -> b (c h w) d')
+            outputs['vehicle_masks'] = None  # No vehicle masks when not using vehicle flow
+
+        # Perform ICP refinement early if we have multiple frames (needed for ego pose and velocity refinement)
+        ego_T_ego_key = ('ego_T_ego', 0, self.context_span)
+        if frame_camrea > self.num_cams and ego_T_ego_key in inputs:
+            # Get ego_T_ego transformations
+            ego_T_ego_0toN_initial = inputs[ego_T_ego_key]
+
+            # Store the transformation being used (no refinement)
+            outputs['ego_T_ego_original'] = ego_T_ego_0toN_initial
+        
+        if frame_camrea > self.num_cams:
+            num_frames = frame_camrea // self.num_cams
+            if num_frames != 2:
+                raise NotImplementedError(f"Context frames should have exactly 2 frames (frame 0 and frame {self.context_span}), but got {num_frames} frames")
+
+            xyz_transformed = outputs['xyz'].clone()
+            if self.translate_3dgs:
+                rot_maps_transformed = outputs['rot_maps'].clone()
+                sh_maps_transformed = outputs['sh_maps'].clone()
+            mid_point = xyz_transformed.shape[1] // 2
+
+
+            # Check the original input to see if we have per-camera transformations
+            ego_T_ego_key = ('ego_T_ego', 0, self.context_span)
+            ego_T_ego_0toN_input = inputs.get(ego_T_ego_key, None)
+            if ego_T_ego_0toN_input is not None:
+                # Check if original input has per-camera transformations
+                if ego_T_ego_0toN_input.dim() == 4:
+                    # [batch_size, num_cameras, 4, 4] - Use camera-specific transformations
+                    batch_size = xyz_transformed.shape[0]
+                    points_per_camera = self.height * self.width
+
+                    # Check if we have refined per-camera transformations
+                    use_refined = 'ego_T_ego_refined' in outputs
+                    if use_refined:
+                        refined_transforms = outputs['ego_T_ego_refined']
+
+                    # Transform each camera's frame N points separately
+                    for cam_id in range(self.num_cams):
+                        cam_start = mid_point + cam_id * points_per_camera
+                        cam_end = mid_point + (cam_id + 1) * points_per_camera
+
+                        # Get camera-specific transformation: ego0 → egoN
+                        # Use refined transformation if available
+                        if use_refined:
+                            ego_T_ego_0toN_cam = refined_transforms[:, cam_id]
+                        else:
+                            ego_T_ego_0toN_cam = ego_T_ego_0toN_input[:, cam_id]  # [batch_size, 4, 4]
+
+                        # Invert to get: egoN → ego0
+                        ego_T_ego_Nto0_cam = torch.linalg.inv(ego_T_ego_0toN_cam)
+
+                        # Transform this camera's frame N points to frame 0 ego coordinates
+                        xyz_transformed[:, cam_start:cam_end, :] = self.transform_points(
+                            xyz_transformed[:, cam_start:cam_end, :],
+                            ego_T_ego_Nto0_cam
+                        )
+                    if self.translate_3dgs:
+                        if ego_T_ego_Nto0_cam.dim() == 2:
+                            R_Nto0 = ego_T_ego_Nto0_cam[:3, :3]  # [3, 3]
+                        else:
+                            R_Nto0 = ego_T_ego_Nto0_cam[:, :3, :3]  # [B, 3, 3]
+
+                        try:
+                            from pytorch3d.transforms import matrix_to_quaternion
+                            q_Nto0 = matrix_to_quaternion(torch.linalg.inv(R_Nto0)) # [3,] or [B, 4]
+                        except ImportError:
+                            def matrix_to_quaternion_manual(R):
+                                # R: [..., 3, 3]
+                                tr = R[..., 0, 0] + R[..., 1, 1] + R[..., 2, 2]
+                                qw = torch.sqrt((tr + 1.0).clamp(min=0)) / 2.0
+                                qx = (R[..., 2, 1] - R[..., 1, 2]) / (4 * qw + 1e-8)
+                                qy = (R[..., 0, 2] - R[..., 2, 0]) / (4 * qw + 1e-8)
+                                qz = (R[..., 1, 0] - R[..., 0, 1]) / (4 * qw + 1e-8)
+                                return torch.stack([qw, qx, qy, qz], dim=-1)
+                            q_Nto0 = matrix_to_quaternion_manual(R_Nto0) 
+
+                        if rot_maps_transformed[:, cam_start:cam_end, :].dim() == 2:
+                            # [N, 4]
+                            if q_Nto0.dim() == 1:
+                                q_Nto0 = q_Nto0.unsqueeze(0)  # [1, 4]
+                            q_Nto0 = q_Nto0.expand(rot_maps_transformed[:, cam_start:cam_end, :].shape[0], -1)  # [N, 4]
+                        else:
+                            # [B, N, 4]
+                            if q_Nto0.dim() == 1:
+                                q_Nto0 = q_Nto0.unsqueeze(0).unsqueeze(0)  # [1, 1, 4]
+                            elif q_Nto0.dim() == 2:
+                                q_Nto0 = q_Nto0.unsqueeze(1)  # [B, 1, 4]
+                            q_Nto0 = q_Nto0.expand(-1, rot_maps_transformed[:, cam_start:cam_end, :].shape[1], -1)  # [B, N, 4]
+
+                        def quat_multiply(q1, q2):
+                            w1, x1, y1, z1 = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
+                            w2, x2, y2, z2 = q2[..., 0], q2[..., 1], q2[..., 2], q2[..., 3]
+                            w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+                            x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+                            y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+                            z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+                            return torch.stack([w, x, y, z], dim=-1)
+
+                        rot_maps_slice = rot_maps_transformed[:, cam_start:cam_end, :].clone()
+                        rot_maps_transformed_slice = quat_multiply(q_Nto0, rot_maps_slice)
+                        rot_maps_transformed = torch.cat([
+                            rot_maps_transformed[:, :cam_start, :],
+                            rot_maps_transformed_slice,
+                            rot_maps_transformed[:, cam_end:, :]
+                        ], dim=1)
+
+                        outputs['rot_maps_transformed'] = rot_maps_transformed
+                        outputs['sh_maps_transformed'] = sh_maps_transformed
+                    
+                    outputs['xyz_transformed'] = xyz_transformed
+                else:
+                    # [batch_size, 4, 4] or [4, 4] - Use unified transformation for all cameras
+                    # Prefer refined transformation if available
+                    if 'ego_T_ego_refined' in outputs:
+                        refined = outputs['ego_T_ego_refined']
+                        # If refined is per-camera [batch_size, num_cameras, 4, 4], use camera 0
+                        if refined.dim() == 4:
+                            ego_T_ego_0toN = refined[:, 0]  # Use camera 0's refined transformation
+                        else:
+                            ego_T_ego_0toN = refined
+                    else:
+                        ego_T_ego_0toN = ego_T_ego_0toN_input
+
+                    # Ensure batch dimension exists
+                    if ego_T_ego_0toN.dim() == 2:
+                        ego_T_ego_0toN = ego_T_ego_0toN.unsqueeze(0)
+                    elif ego_T_ego_0toN.dim() == 3 and ego_T_ego_0toN.shape[0] == 1:
+                        # Already has batch dimension of 1, expand to match batch size
+                        batch_size = xyz_transformed.shape[0]
+                        if batch_size > 1:
+                            ego_T_ego_0toN = ego_T_ego_0toN.expand(batch_size, -1, -1)
+
+                    ego_T_ego_Nto0 = torch.linalg.inv(ego_T_ego_0toN)
+                    xyz_transformed[:, mid_point:, :] = self.transform_points(
+                        xyz_transformed[:, mid_point:, :],
+                        ego_T_ego_Nto0
+                    )
+                    outputs['xyz_transformed'] = xyz_transformed
+            else:
+                outputs['xyz_transformed'] = outputs['xyz']
+                outputs['rot_maps_transformed'] = outputs['rot_maps']
+                outputs['sh_maps_transformed'] = outputs['sh_maps']
+        else:
+            outputs['xyz_transformed'] = outputs['xyz']
+            outputs['rot_maps_transformed'] = outputs['rot_maps']
+            outputs['sh_maps_transformed'] = outputs['sh_maps']
+
+        del bfc_K, bfc_c2e, bfc_depth_maps
+        if not is_voxel:
+            del bfc_xyz, rot_maps, scale_maps, opacity_maps, bfc_sh
+        return outputs

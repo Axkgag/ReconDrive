@@ -156,8 +156,52 @@ def extract_stage1_inputs(stage1, batch):
 
 
 
-def get_sparse_voxel_feats(stage1_model, images, intrinsics, extrinsics, depth_maps_override=None):
-    """Extract sparse voxel features while honoring optional GT depth override."""
+def extract_occ_voxel_feats(stage1_model, aggregated_tokens_list, images, patch_start_idx, intrinsics, extrinsics, occ_inputs):
+    """Extract OCC voxel query features before Gaussian decoding."""
+    gs_head = stage1_model.gs_head
+    multi_level_feats = gs_head.build_multilevel_features(
+        aggregated_tokens_list,
+        images=images,
+        patch_start_idx=patch_start_idx,
+    )
+    voxel_meta = gs_head.build_occ_queries(
+        occ_inputs=occ_inputs,
+        device=multi_level_feats[0].device,
+        dtype=multi_level_feats[0].dtype,
+    )
+    voxel_centers = voxel_meta["voxel_centers"]
+    batch_idx = voxel_meta["batch_idx"]
+    voxel_coords = voxel_meta["voxel_coords"]
+    coords_with_batch = torch.cat([batch_idx.unsqueeze(-1), voxel_coords], dim=-1)
+    if voxel_centers.numel() == 0:
+        return None, coords_with_batch, voxel_meta
+
+    query = gs_head.occ_query_embed(gs_head.normalize_voxel_centers(voxel_centers))
+    feature_h, feature_w = multi_level_feats[0].shape[-2:]
+    reference_points, camera_mask = gs_head.project_voxels_to_cameras(
+        voxel_centers=voxel_centers,
+        batch_idx=batch_idx,
+        intrinsics=intrinsics,
+        extrinsics=extrinsics,
+        feature_h=feature_h,
+        feature_w=feature_w,
+    )
+
+    voxel_feats = query
+    for layer in gs_head.occ_transformer:
+        voxel_feats = layer(
+            query=voxel_feats,
+            coords_with_batch=coords_with_batch,
+            multi_level_feats=multi_level_feats,
+            reference_points=reference_points,
+            batch_idx=batch_idx,
+            camera_mask=camera_mask,
+        )
+    return voxel_feats, coords_with_batch, voxel_meta
+
+
+def get_sparse_voxel_feats(stage1_model, images, intrinsics, extrinsics, depth_maps_override=None, occ_inputs=None):
+    """Extract sparse voxel features while honoring the configured voxel source."""
     with torch.amp.autocast("cuda", enabled=images.is_cuda, dtype=torch.bfloat16):
         aggregated_tokens_list, patch_start_idx = stage1_model.aggregator(images.to(torch.bfloat16))
 
@@ -168,6 +212,20 @@ def get_sparse_voxel_feats(stage1_model, images, intrinsics, extrinsics, depth_m
         depth_maps = torch.nn.functional.sigmoid(torch.log(depth_maps))
         depth_range = stage1_model.max_depth - stage1_model.min_depth
         depth_maps = stage1_model.min_depth + depth_range * depth_maps
+
+        if getattr(stage1_model, "voxel_feature_source", "depth_lift") == "occ_gt":
+            voxel_feats, unique_coords, _ = extract_occ_voxel_feats(
+                stage1_model,
+                aggregated_tokens_list,
+                images,
+                patch_start_idx,
+                intrinsics,
+                extrinsics,
+                occ_inputs,
+            )
+            shape = tuple(depth_maps.shape[:4])
+            num_voxels = None if voxel_feats is None else voxel_feats.shape[0]
+            return voxel_feats, unique_coords, depth_maps, shape, num_voxels
 
         depth_maps_for_voxel = depth_maps_override if depth_maps_override is not None else depth_maps
         if depth_maps_for_voxel.dim() == 5 and depth_maps_for_voxel.shape[-1] == 1:
@@ -201,28 +259,52 @@ def dense_to_sparse(dense, unique_coords):
     return dense[coords[:, 0], coords[:, 1], coords[:, 2], coords[:, 3]]
 
 
-def build_voxel_out(stage1_model, sparse_feats, unique_coords):
-    sparse_feats = stage1_model.gs_head.refiner(sparse_feats, unique_coords)
-    voxel_params = stage1_model.gs_head.decoder(sparse_feats)
-    voxel_params = voxel_params.view(
-        sparse_feats.shape[0],
-        stage1_model.gs_head.gaussians_per_voxel,
-        stage1_model.gs_head.raw_gs_dim,
-    )
-    return {
-        "voxel_params": voxel_params,
-        "unique_coords": unique_coords,
-        "voxel_centers": stage1_model.gs_head._coords_to_world_pos(unique_coords),
+def build_sparse_recontrast(stage1_model, sparse_feats, unique_coords, batch_size, depth):
+    gs_head = stage1_model.gs_head
+    sparse_feats = gs_head.refiner(sparse_feats, unique_coords)
+    raw = gs_head.decoder(sparse_feats).view(sparse_feats.shape[0], gs_head.gaussians_per_voxel, gs_head.raw_gs_dim)
+    offset, rot, scale, opacity, sh = raw.split((3, 4, 3, 1, 3 * stage1_model.d_sh), dim=-1)
+
+    offset = torch.tanh(offset) * (stage1_model.voxel_size * 0.5)
+    rot = rot / (rot.norm(dim=-1, keepdim=True) + 1e-8)
+    scale = torch.nn.functional.softplus(scale, beta=1) * 0.01
+    opacity = torch.sigmoid(opacity)
+    sh = sh.view(sh.shape[0], sh.shape[1], 3, stage1_model.d_sh) * stage1_model.sh_mask
+    sh = sh.transpose(-1, -2).contiguous()
+
+    coords = unique_coords.long()
+    voxel_centers = gs_head.voxel_coords_to_world(coords[:, 1:], dtype=sparse_feats.dtype)
+    xyz_sparse = voxel_centers.unsqueeze(1) + offset
+
+    outputs = {
+        "xyz": [],
+        "rot_maps": [],
+        "scale_maps": [],
+        "opacity_maps": [],
+        "sh_maps": [],
+        "forward_flow": [],
+        "sparse_gaussians": True,
+        "ae_global_points": True,
     }
+    for batch_id in range(batch_size):
+        batch_mask = coords[:, 0] == batch_id
+        xyz_b = xyz_sparse[batch_mask].reshape(-1, 3)
+        outputs["xyz"].append(xyz_b)
+        outputs["rot_maps"].append(rot[batch_mask].reshape(-1, 4))
+        outputs["scale_maps"].append(scale[batch_mask].reshape(-1, 3))
+        outputs["opacity_maps"].append(opacity[batch_mask].reshape(-1, 1))
+        outputs["sh_maps"].append(sh[batch_mask].reshape(-1, sh.shape[-2], sh.shape[-1]))
+        outputs["forward_flow"].append(xyz_b.new_zeros((xyz_b.shape[0], 3)))
+    outputs["xyz_transformed"] = outputs["xyz"]
+    outputs["rot_maps_transformed"] = outputs["rot_maps"]
+    outputs["sh_maps_transformed"] = outputs["sh_maps"]
+    if depth is not None:
+        outputs["pred_depth_maps"] = depth.squeeze(-1) if depth.dim() == 5 else depth
+    return outputs
 
 
 def render_from_sparse(stage1, sparse_feats, unique_coords, images, depth):
-    voxel_out = build_voxel_out(stage1.model, sparse_feats, unique_coords)
-    recontrast = stage1.model.recontrast_voxel_out(voxel_out, images, depth)
-    if recontrast["xyz"].dim() == 4:
-        recontrast["xyz"] = recontrast["xyz"].reshape(recontrast["xyz"].shape[0], -1, 3)
-    recontrast["ae_global_points"] = True
-    return recontrast
+    return build_sparse_recontrast(stage1.model, sparse_feats, unique_coords, images.shape[0], depth)
 
 
 def tensor_to_uint8(tensor):
@@ -292,7 +374,12 @@ def visualize_batch(stage1, vae, batch, batch_idx, global_step, save_dir, split,
     stage1._set_stage1_frame_ids()
     images, intrinsics, extrinsics, depth_override = extract_stage1_inputs(stage1, batch)
     voxel_feats, unique_coords, depth, _, _ = get_sparse_voxel_feats(
-        stage1.model, images, intrinsics, extrinsics, depth_maps_override=depth_override
+        stage1.model,
+        images,
+        intrinsics,
+        extrinsics,
+        depth_maps_override=depth_override,
+        occ_inputs=batch["context_frames"],
     )
     dense, _ = sparse_to_dense(voxel_feats, unique_coords, grid_size, images.shape[0])
     recon_dense, _, _ = unwrap_model(vae)(dense)
@@ -396,7 +483,12 @@ def train_one_epoch(stage1, vae, loader, optimizer, scheduler, cfg, device, epoc
 
         with torch.no_grad():
             voxel_feats, unique_coords, _, _, _ = get_sparse_voxel_feats(
-                stage1.model, images, intrinsics, extrinsics, depth_maps_override=depth_override
+                stage1.model,
+                images,
+                intrinsics,
+                extrinsics,
+                depth_maps_override=depth_override,
+                occ_inputs=batch["context_frames"],
             )
             dense, mask = sparse_to_dense(voxel_feats, unique_coords, grid_size, images.shape[0])
 
@@ -471,7 +563,12 @@ def validate(stage1, vae, loader, cfg, device, epoch, global_step, writer, save_
         batch = to_device(batch, device)
         images, intrinsics, extrinsics, depth_override = extract_stage1_inputs(stage1, batch)
         voxel_feats, unique_coords, _, _, _ = get_sparse_voxel_feats(
-            stage1.model, images, intrinsics, extrinsics, depth_maps_override=depth_override
+            stage1.model,
+            images,
+            intrinsics,
+            extrinsics,
+            depth_maps_override=depth_override,
+            occ_inputs=batch["context_frames"],
         )
         dense, mask = sparse_to_dense(voxel_feats, unique_coords, grid_size, images.shape[0])
         recon, z_mu, z_logvar = vae(dense)

@@ -115,8 +115,8 @@ class ReconDriveStage1_LITModelModule(ReconDrive_LITModelModule):
             else None
         )
 
-        # 新增：计算 Occ 损失（仅在启用时）
-        if getattr(self, 'enable_occ_supervision', False):
+        # OCC GT can be used as voxel queries without adding an extra geometry loss.
+        if getattr(self, 'enable_occ_loss', getattr(self, 'enable_occ_supervision', False)):
             loss_occ = self.compute_occ_loss(batch_recontrast_data, batch_input)
             self.log(f'{stage}/occ', loss_occ.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         else:
@@ -249,7 +249,7 @@ class ReconDriveStage1_LITModelModule(ReconDrive_LITModelModule):
         Save composite figure for Stage1 training visualization.
 
         Rows: one per camera
-        Columns: GT Image | Stage1 Render | Depth Map | Stage1 3D Gauss
+        Columns: GT Image | Stage1 Render | OCC Proj(train-K) | Stage1 3D Gauss
         """
         from pytorch_lightning.utilities import rank_zero_only
 
@@ -266,24 +266,12 @@ class ReconDriveStage1_LITModelModule(ReconDrive_LITModelModule):
             os.makedirs(save_dir, exist_ok=True)
 
             frame_id = 0
-            gt_imgs, stage1_imgs, pred_depth_imgs, gt_depth_imgs = [], [], [], []
-
-            # Pre-extract predicted depth maps: [B, num_cams*H*W] -> [num_cams, H, W]
-            pred_depths_all = None
-            if 'pred_depths' in batch_recontrast_data:
-                from einops import rearrange as _rearrange
-                pred_depths_all = _rearrange(
-                    batch_recontrast_data['pred_depths'][0:1],
-                    'b (c h w) -> b c h w',
-                    c=self.num_cams,
-                    h=self.height,
-                    w=self.width,
-                )[0]  # [num_cams, H, W]
+            gt_imgs, stage1_imgs = [], []
+            occ_base_imgs = []
 
             for cam_id in range(self.num_cams):
                 pred_key = ('gaussian_color', frame_id, cam_id)
                 gt_key   = ('groudtruth',     frame_id, cam_id)
-                gt_depth_key = ('gt_depths', frame_id, cam_id)
 
                 if pred_key not in batch_splating_data or gt_key not in batch_splating_data:
                     return
@@ -309,30 +297,26 @@ class ReconDriveStage1_LITModelModule(ReconDrive_LITModelModule):
                 gt_imgs.append((gt_img * vis_mask).clamp(0, 1))
                 stage1_imgs.append((pred_img * vis_mask).clamp(0, 1))
 
-                if pred_depths_all is not None:
-                    pred_depth_imgs.append(pred_depths_all[cam_id].detach().cpu().float().numpy())
-                else:
-                    pred_depth_imgs.append(None)
-
-                if gt_depth_key in batch_splating_data:
-                    gt_depth_np = batch_splating_data[gt_depth_key][0].detach().cpu().float().numpy()
-                    gt_depth_imgs.append(np.squeeze(gt_depth_np))
-                else:
-                    gt_depth_imgs.append(None)
+                # Use the rendered/GT training resolution as the OCC projection
+                # canvas. color_org is captured before resize and does not match
+                # the resized intrinsics used by Stage1 rendering.
+                occ_base_imgs.append((gt_img * vis_mask).detach().cpu().float().clamp(0, 1))
 
             stage1_3d_img = self._render_gaussian_scene_image(batch_recontrast_data, batch_idx_in_batch=0)
+            occ_projection = self._build_occ_projection_comparison(
+                batch_recontrast_data,
+                base_imgs=occ_base_imgs,
+                batch_idx_in_batch=0,
+            )
 
-            has_gt_depth_vis = any(depth is not None for depth in gt_depth_imgs)
-            ncols = 5 if has_gt_depth_vis else 4
+            has_occ_projection = occ_projection is not None
+            ncols = 4
             fig, axes = plt.subplots(
                 nrows=self.num_cams, ncols=ncols,
                 figsize=(4 * ncols, self.num_cams * 2.3),
                 dpi=120,
             )
-            col_titles = ['GT Image', 'Stage1 Render', 'Pred Depth']
-            if has_gt_depth_vis:
-                col_titles.append('GT Depth')
-            col_titles.append('Stage1 3D Gauss')
+            col_titles = ['GT Image', 'Stage1 Render', 'OCC Proj (train-K)', 'Stage1 3D Gauss']
 
             for cam_id in range(self.num_cams):
                 cam_name = (self.camera_names[cam_id]
@@ -341,23 +325,22 @@ class ReconDriveStage1_LITModelModule(ReconDrive_LITModelModule):
                 axes[cam_id, 0].imshow(self._tensor_to_uint8(gt_imgs[cam_id]))
                 axes[cam_id, 1].imshow(self._tensor_to_uint8(stage1_imgs[cam_id]))
 
-                depth_np = pred_depth_imgs[cam_id]
-                if depth_np is not None:
-                    axes[cam_id, 2].imshow(depth_np, cmap='magma', vmin=self.min_depth, vmax=self.max_depth)
-                else:
-                    axes[cam_id, 2].text(0.5, 0.5, 'N/A', ha='center', va='center',
-                                         transform=axes[cam_id, 2].transAxes)
-
-                if has_gt_depth_vis:
-                    gt_depth_np = gt_depth_imgs[cam_id]
-                    if gt_depth_np is not None:
-                        axes[cam_id, 3].imshow(gt_depth_np, cmap='magma', vmin=self.min_depth, vmax=self.max_depth)
+                if has_occ_projection:
+                    occ_vis = occ_projection[cam_id]
+                    if occ_vis is not None:
+                        axes[cam_id, 2].imshow(occ_vis["train_image"])
                     else:
-                        axes[cam_id, 3].text(0.5, 0.5, 'N/A', ha='center', va='center',
-                                             transform=axes[cam_id, 3].transAxes)
-                    axes[cam_id, 4].imshow(stage1_3d_img)
+                        axes[cam_id, 2].text(
+                            0.5, 0.5, 'N/A', ha='center', va='center',
+                            transform=axes[cam_id, 2].transAxes,
+                        )
                 else:
-                    axes[cam_id, 3].imshow(stage1_3d_img)
+                    axes[cam_id, 2].text(
+                        0.5, 0.5, 'N/A', ha='center', va='center',
+                        transform=axes[cam_id, 2].transAxes,
+                    )
+
+                axes[cam_id, 3].imshow(stage1_3d_img)
 
                 axes[cam_id, 0].set_ylabel(cam_name, fontsize=9)
                 for c in range(ncols):
@@ -381,6 +364,200 @@ class ReconDriveStage1_LITModelModule(ReconDrive_LITModelModule):
         """[C, H, W] float in [0,1] → uint8 numpy [H, W, C] for matplotlib."""
         arr = t.detach().cpu().float().clamp(0, 1).numpy()
         return (arr.transpose(1, 2, 0) * 255).astype(np.uint8)
+
+    def _build_occ_projection_comparison(self, batch_recontrast_data, base_imgs, batch_idx_in_batch=0, radius=1):
+        inputs = batch_recontrast_data.get('inputs')
+        if not isinstance(inputs, dict):
+            return None
+
+        gs_head = getattr(getattr(self, 'model', None), 'gs_head', None)
+        if gs_head is None or not hasattr(gs_head, 'get_occ_query_mask'):
+            return None
+
+        k = inputs.get('K')
+        c2e_extr = inputs.get('c2e_extr')
+        if k is None or c2e_extr is None:
+            return None
+
+        with torch.no_grad():
+            occ_mask = gs_head.get_occ_query_mask(inputs, device=k.device)
+            if occ_mask is None:
+                return None
+            if occ_mask.dim() == 3:
+                occ_mask = occ_mask.unsqueeze(0)
+            if batch_idx_in_batch >= occ_mask.shape[0]:
+                return None
+
+            voxel_coords = occ_mask[batch_idx_in_batch].nonzero(as_tuple=False)
+            if voxel_coords.numel() == 0:
+                return [None for _ in range(self.num_cams)]
+
+            dtype = k.dtype if torch.is_floating_point(k) else torch.float32
+            voxel_centers = gs_head.voxel_coords_to_world(voxel_coords, dtype=dtype)
+            batch_idx = torch.full(
+                (voxel_coords.shape[0],),
+                batch_idx_in_batch,
+                device=k.device,
+                dtype=torch.long,
+            )
+
+            train_h = int(base_imgs[0].shape[-2])
+            train_w = int(base_imgs[0].shape[-1])
+
+            train_reference_points, train_camera_mask = gs_head.project_voxels_to_cameras(
+                voxel_centers,
+                batch_idx,
+                k,
+                c2e_extr,
+                train_h,
+                train_w,
+            )
+        
+        overlays = []
+        max_cams = min(self.num_cams, train_reference_points.shape[1], len(base_imgs))
+        for cam_id in range(max_cams):
+            visible_train = train_camera_mask[:, cam_id]
+            image_uint8 = self._tensor_to_uint8(base_imgs[cam_id])
+
+            if not torch.any(visible_train):
+                overlays.append({
+                    "train_image": image_uint8,
+                    "train_count": 0,
+                })
+                continue
+
+            train_xs, train_ys, _ = self._project_points_to_pixels(
+                train_reference_points[:, cam_id],
+                visible_train,
+                train_w,
+                train_h,
+            )
+
+            train_image = self._overlay_projected_points(
+                image_uint8,
+                train_xs,
+                train_ys,
+                color=(255, 64, 64),
+                radius=radius,
+            )
+            overlays.append({
+                "train_image": train_image,
+                "train_count": int(visible_train.sum().item()),
+            })
+
+        while len(overlays) < self.num_cams:
+            overlays.append(None)
+        return overlays
+
+    @staticmethod
+    def _project_points_to_pixels(reference_points, visible_mask, width, height):
+        if not torch.any(visible_mask):
+            empty = np.empty((0,), dtype=np.int64)
+            empty_uv = np.empty((0, 2), dtype=np.float32)
+            return empty, empty, empty_uv
+        uv = reference_points[visible_mask]
+        xs = torch.round(uv[:, 0] * max(width - 1, 1)).long().detach().cpu().numpy()
+        ys = torch.round(uv[:, 1] * max(height - 1, 1)).long().detach().cpu().numpy()
+        return xs, ys, uv.detach().cpu().numpy()
+
+    @staticmethod
+    def _overlay_projected_points(image, xs, ys, color=(0, 255, 0), radius=1):
+        if xs.size == 0 or ys.size == 0:
+            return image
+
+        h, w = image.shape[:2]
+        valid = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+        if not np.any(valid):
+            return image
+
+        xs = xs[valid]
+        ys = ys[valid]
+        flat = np.unique(ys * w + xs)
+        ys = flat // w
+        xs = flat % w
+
+        overlay = image.astype(np.float32, copy=True)
+        color_arr = np.asarray(color, dtype=np.float32)
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                xx = np.clip(xs + dx, 0, w - 1)
+                yy = np.clip(ys + dy, 0, h - 1)
+                overlay[yy, xx] = overlay[yy, xx] * 0.25 + color_arr * 0.75
+        return np.clip(overlay, 0, 255).astype(np.uint8)
+
+    def _render_occ_gt_scene_image(self, inputs, batch_idx_in_batch=0, max_points=None, elev=25, azim=-60):
+        if not isinstance(inputs, dict):
+            return None
+
+        occ_semantics = inputs.get('occ_semantics')
+        if occ_semantics is None:
+            return None
+        if not torch.is_tensor(occ_semantics):
+            occ_semantics = torch.from_numpy(occ_semantics)
+        if occ_semantics.dim() == 3:
+            occ_semantics = occ_semantics.unsqueeze(0)
+        if batch_idx_in_batch >= occ_semantics.shape[0]:
+            return None
+
+        occ_semantics = occ_semantics[batch_idx_in_batch]
+        voxel_coords = torch.ones_like(occ_semantics, dtype=torch.bool).nonzero(as_tuple=False)
+        if voxel_coords.numel() == 0:
+            return None
+
+        labels = occ_semantics.reshape(-1).detach().cpu().numpy().astype(np.int32)
+        keep = labels != 17
+        voxel_coords = voxel_coords[keep]
+        labels = labels[keep]
+        if voxel_coords.numel() == 0:
+            return None
+        if max_points is not None and voxel_coords.shape[0] > max_points:
+            sample_idx = np.random.choice(voxel_coords.shape[0], max_points, replace=False)
+            voxel_coords = voxel_coords[sample_idx]
+            labels = labels[sample_idx]
+
+        gs_head = getattr(getattr(self, 'model', None), 'gs_head', None)
+        if gs_head is not None and hasattr(gs_head, 'voxel_coords_to_world'):
+            xyz = gs_head.voxel_coords_to_world(voxel_coords.to(device=self.device), dtype=torch.float32)
+            xyz = xyz.detach().cpu().numpy()
+        else:
+            voxel_size = float(getattr(self, 'voxel_size', 0.4))
+            origin = np.array([
+                getattr(self, 'voxel_x_range', (-40.0, 40.0))[0],
+                getattr(self, 'voxel_y_range', (-40.0, 40.0))[0],
+                getattr(self, 'voxel_z_range', (-1.0, 5.4))[0],
+            ], dtype=np.float32)
+            xyz = origin[None] + (voxel_coords.detach().cpu().numpy().astype(np.float32) + 0.5) * voxel_size
+
+        cmap = plt.get_cmap('tab20')
+        rgb = cmap((labels % 20) / 19.0)[:, :3]
+        rgb[labels == 0] = np.array([0.78, 0.78, 0.78], dtype=np.float32)
+        alpha = np.full((rgb.shape[0], 1), 0.75, dtype=np.float32)
+        alpha[labels == 0] = 0.03
+        rgba = np.concatenate([rgb, alpha], axis=1)
+
+        fig = plt.figure(figsize=(5, 5), dpi=100)
+        ax = fig.add_subplot(111, projection='3d')
+        ax.scatter(xyz[:, 0], xyz[:, 1], xyz[:, 2], c=rgba, s=0.25, linewidths=0, depthshade=True)
+
+        ranges = np.array([[xyz[:, i].min(), xyz[:, i].max()] for i in range(3)])
+        max_range = (ranges[:, 1] - ranges[:, 0]).max() / 2 or 1.0
+        mid = ranges.mean(axis=1)
+        ax.set_xlim(mid[0] - max_range, mid[0] + max_range)
+        ax.set_ylim(mid[1] - max_range, mid[1] + max_range)
+        ax.set_zlim(mid[2] - max_range, mid[2] + max_range)
+        ax.set_xlabel('X', fontsize=7)
+        ax.set_ylabel('Y', fontsize=7)
+        ax.set_zlabel('Z', fontsize=7)
+        ax.tick_params(labelsize=6)
+        ax.view_init(elev=elev, azim=azim)
+        ax.set_title(f'OCC GT labels != 17 {len(xyz):,}', fontsize=8)
+        fig.tight_layout()
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', bbox_inches='tight')
+        plt.close(fig)
+        buf.seek(0)
+        return np.array(Image.open(buf).convert('RGB'))
 
     @staticmethod
     def _render_gaussian_scene_image(recontrast_data, batch_idx_in_batch=0,

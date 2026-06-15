@@ -66,21 +66,33 @@ class NuScenesdataset3D(NuScenesdataset4D):
         if 'c2e_extr' in cur_sample:
             cur_sample['extrinsics'] = cur_sample['c2e_extr']
 
-        all_context_dict = {}
-        all_dict = {}
-        for k, v in cur_sample.items():
-            if torch.is_tensor(v):
-                all_dict[k] = v
-                all_context_dict[k] = v
-            elif isinstance(v, (list, tuple)) and len(v) > 0 and isinstance(v[0], torch.Tensor):
-                all_dict[k] = v
-                all_context_dict[k] = v
-            else:
-                all_dict[k] = v
-                all_context_dict[k] = v
+        # Stage1 3D training only consumes context_frames for reconstruction and
+        # all_dict for rendering. Avoid returning large unused tensors multiple
+        # times: color_org is the original 900x1600 image and costs ~100MB per
+        # sample copy after collate.
+        context_keys = {
+            'idx', 'token', 'scene_token', 'scene_name', 'scene_idx', 'sensor_name',
+            'filename', 'timestamp', 'gt_depth', 'ego_pose', 'mask',
+            'occ_render_mask', 'occ_semantics', 'occ_mask_camera', 'occ_mask_lidar',
+            'occ_surface', 'occ_visible_mask', 'K', 'c2e_extr',
+            'intrinsics', 'extrinsics', ('color_aug', 0),
+        }
+        render_keys = {
+            'idx', 'token', 'scene_token', 'scene_name', 'scene_idx', 'sensor_name',
+            'filename', 'timestamp', 'gt_depth', 'ego_pose', 'mask',
+            'K', 'c2e_extr', 'intrinsics', 'extrinsics', ('color_aug', 0),
+        }
+        slim_cur_keys = {
+            'idx', 'token', 'scene_token', 'scene_name', 'scene_idx',
+            'sensor_name', 'filename', 'timestamp',
+        }
+
+        all_context_dict = {k: v for k, v in cur_sample.items() if k in context_keys}
+        all_dict = {k: v for k, v in cur_sample.items() if k in render_keys}
+        slim_cur_sample = {k: v for k, v in cur_sample.items() if k in slim_cur_keys}
 
         ret_sample = {
-            'cur_sample': cur_sample,
+            'cur_sample': slim_cur_sample,
             'context_frames': all_context_dict,
             'target_frames': {},
             'all_dict': all_dict,
@@ -104,7 +116,7 @@ class NuScenesdataset3D(NuScenesdataset4D):
                     visible_mask = occ_mask_lidar if occ_mask_lidar is not None else occ_mask_camera
                     surface_occ = None
                     if visible_mask is not None:
-                        surface_occ = (occ_semantics > 0) & (visible_mask > 0)
+                        surface_occ = (occ_semantics != 17) & (visible_mask > 0)
                     data.update({
                         'occ_semantics': occ_semantics,  # [200,200,16] uint8
                         'occ_mask_camera': occ_mask_camera,

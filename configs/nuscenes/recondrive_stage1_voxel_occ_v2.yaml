@@ -1,6 +1,6 @@
 save_dir: './work_dirs/recondrive_stage1_voxel_training'
 seed: 42
-train_epoch: 20
+train_epoch: 50
 devices: [0,1,2,3,4,5,6,7]
 
 # Occ 监督统一开关（定义锚点，只需在此处修改）
@@ -20,9 +20,9 @@ model_cfg:
   enable_nan_checks: true
   learning_rate: 0.00001
   lr_scheduler: 'onecycle'
-  onecycle_pct_start: 0.05
+  onecycle_pct_start: 0.15
   onecycle_div_factor: 25.0
-  onecycle_final_div_factor: 10000.0
+  onecycle_final_div_factor: 100.0
   use_separate_occ_optimizer: true
   occ_lr: 0.0002
   occ_weight_decay: 0.01

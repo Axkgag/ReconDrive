@@ -39,28 +39,36 @@ class VGGT4DGS_LITDataModule(pl.LightningDataModule):
     def train_dataloader(self):
         if self.train_dataset is None:
             return None
+        loader_kwargs = {}
+        if self.num_workers > 0:
+            loader_kwargs['prefetch_factor'] = getattr(self, 'prefetch_factor', 1)
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
             shuffle=self.data_shuffle,
             drop_last=self.drop_last,
             num_workers=self.num_workers,
-            pin_memory=True,
+            pin_memory=getattr(self, 'pin_memory', False),
             collate_fn=custom_collate_fn,
+            **loader_kwargs,
         )
             
     
     def val_dataloader(self):
         if self.val_dataset is None:
             return None
+        loader_kwargs = {}
+        if self.num_workers > 0:
+            loader_kwargs['prefetch_factor'] = getattr(self, 'prefetch_factor', 1)
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             drop_last=False,
             num_workers=self.num_workers,
-            pin_memory=True,
+            pin_memory=getattr(self, 'pin_memory', False),
             collate_fn=custom_collate_fn,
+            **loader_kwargs,
         )
     
     def test_dataloader(self, scene_based=True):
@@ -93,7 +101,7 @@ class VGGT4DGS_LITDataModule(pl.LightningDataModule):
                 shuffle=False,
                 drop_last=False,
                 num_workers=self.num_workers,
-                pin_memory=True,
+                pin_memory=getattr(self, 'pin_memory', False),
                 collate_fn=custom_collate_fn,
             )
     

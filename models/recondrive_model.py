@@ -577,6 +577,13 @@ class ReconDriveVoxelModel(torch.nn.Module):
         voxel_z_range=(-1.0, 5.4),
         voxel_feature_dim: int = 256,
         gaussians_per_voxel: int = 1,
+        voxel_feature_source: str = 'depth_lift',
+        occ_query_source: str = 'occupied',
+        occ_num_levels: int = 4,
+        occ_num_heads: int = 8,
+        occ_num_points: int = 4,
+        occ_attn_chunk_size: int = 2048,
+        occ_transformer_layers: int = 3,
     ):
         super().__init__()
         self.img_size = 518
@@ -586,6 +593,7 @@ class ReconDriveVoxelModel(torch.nn.Module):
         self.min_depth = min_depth
         self.max_depth = max_depth
         self.voxel_size = voxel_size
+        self.voxel_feature_source = voxel_feature_source
 
         vggt_model = VGGT()
         vggt_model.load_state_dict(torch.load(vggt_checkpoint))
@@ -620,11 +628,18 @@ class ReconDriveVoxelModel(torch.nn.Module):
             x_range=tuple(voxel_x_range),
             y_range=tuple(voxel_y_range),
             z_range=tuple(voxel_z_range),
+            feature_source=voxel_feature_source,
+            occ_query_source=occ_query_source,
+            occ_num_levels=occ_num_levels,
+            occ_num_heads=occ_num_heads,
+            occ_num_points=occ_num_points,
+            occ_attn_chunk_size=occ_attn_chunk_size,
+            occ_transformer_layers=occ_transformer_layers,
         )
 
         self.track_head = None
 
-    def forward(self, images, intrinsics, extrinsics, depth_maps_override=None):
+    def forward(self, images, intrinsics, extrinsics, depth_maps_override=None, occ_inputs=None):
         """
         images: [B, V, 3, H, W]
         intrinsics: [B, V, 4, 4] or [B, V, 3, 3]
@@ -653,9 +668,13 @@ class ReconDriveVoxelModel(torch.nn.Module):
                 depth_maps=depth_maps_for_voxel,
                 intrinsics=intrinsics,
                 extrinsics=extrinsics,
+                occ_inputs=occ_inputs,
+                feature_source=self.voxel_feature_source,
             )
+            sparse_gaussians = isinstance(raw_gaussian, dict) and raw_gaussian.get('sparse_gaussians', False)
+            raw_gaussian_values = raw_gaussian['raw_sparse_gaussians'] if sparse_gaussians else raw_gaussian
 
-            offset_maps, rot_maps, scale_maps, opacity_maps, sh_maps = raw_gaussian.split(
+            offset_maps, rot_maps, scale_maps, opacity_maps, sh_maps = raw_gaussian_values.split(
                 (3, 4, 3, 1, 3 * self.d_sh), dim=-1
             )
 
@@ -664,7 +683,9 @@ class ReconDriveVoxelModel(torch.nn.Module):
             scale_maps = nn.functional.softplus(scale_maps, beta=1) * 0.01
             opacity_maps = nn.functional.sigmoid(opacity_maps)
 
-            if sh_maps.dim() == 6:
+            if sparse_gaussians:
+                sh_maps = rearrange(sh_maps, "n k (i c) -> n k i c", i=3)
+            elif sh_maps.dim() == 6:
                 sh_maps = rearrange(sh_maps, "b n h w k (i c) -> b n h w k i c", i=3)
             else:
                 sh_maps = rearrange(sh_maps, "b n h w (i c) -> b n h w i c", i=3)
@@ -690,6 +711,9 @@ class ReconDriveVoxelModel(torch.nn.Module):
             "forward_flow": forward_flow,
             "offset_maps": offset_maps,
         }
+        if sparse_gaussians:
+            ret_dict["sparse_gaussians"] = True
+            ret_dict["voxel_meta"] = raw_gaussian["voxel_meta"]
         return ret_dict
 
 
@@ -722,6 +746,13 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                 voxel_z_range=getattr(self, 'voxel_z_range', [-1.0, 5.4]),
                 voxel_feature_dim=getattr(self, 'voxel_feature_dim', 256),
                 gaussians_per_voxel=getattr(self, 'voxel_gaussians_per_voxel', 1),
+                voxel_feature_source=getattr(self, 'voxel_feature_source', 'depth_lift'),
+                occ_query_source=getattr(self, 'occ_query_source', 'occupied'),
+                occ_num_levels=getattr(self, 'occ_num_levels', 4),
+                occ_num_heads=getattr(self, 'occ_num_heads', 8),
+                occ_num_points=getattr(self, 'occ_num_points', 4),
+                occ_attn_chunk_size=getattr(self, 'occ_attn_chunk_size', 2048),
+                occ_transformer_layers=getattr(self, 'occ_transformer_layers', 3),
             )
         else:
             self.model = ReconDriveModel(
@@ -1195,7 +1226,13 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             sys.exit(-1)
     
     def _check_finite(self, tensor, name):
-        if not self.enable_nan_checks or tensor is None or not torch.is_tensor(tensor):
+        if not self.enable_nan_checks or tensor is None:
+            return
+        if isinstance(tensor, (list, tuple)):
+            for idx, item in enumerate(tensor):
+                self._check_finite(item, f"{name}[{idx}]")
+            return
+        if not torch.is_tensor(tensor):
             return
         finite_mask = torch.isfinite(tensor)
         if finite_mask.all().item():
@@ -1245,27 +1282,41 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         if optimizer is None:
             return
 
-        lr_main = None
-        lr_depth = None
+        group_lrs = {}
         for idx, group in enumerate(optimizer.param_groups):
             group_name = group.get("name")
             group_lr = group.get("lr", None)
             if group_name == "main" or (group_name is None and idx == 0):
-                lr_main = group_lr
+                group_lrs["main"] = group_lr
+            elif group_name == "occ":
+                group_lrs["occ"] = group_lr
             elif group_name == "depth" or (group_name is None and idx == 1):
-                lr_depth = group_lr
+                group_lrs["depth"] = group_lr
 
-        if lr_main is not None:
-            self.log("train/lr_main", lr_main, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
-        if lr_depth is not None:
-            self.log("train/lr_depth", lr_depth, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+        for group_name, group_lr in group_lrs.items():
+            if group_lr is not None:
+                self.log(
+                    f"train/lr_{group_name}",
+                    group_lr,
+                    on_step=True,
+                    on_epoch=False,
+                    prog_bar=False,
+                    sync_dist=True,
+                )
 
     def configure_optimizers(self):
         trainable_params = []
         main_params = []
+        occ_params = []
         depth_params = []
 
         use_depth_group = getattr(self, 'use_separate_depth_optimizer', False) or getattr(self, 'depth_head_lr', self.learning_rate) != self.learning_rate
+        use_occ_group = getattr(self, 'use_separate_occ_optimizer', False)
+        occ_param_prefixes = tuple(getattr(
+            self,
+            'occ_param_prefixes',
+            ('gs_head.occ_query_embed', 'gs_head.occ_transformer'),
+        ))
 
         for name, parameters in self.model.named_parameters():
             if not parameters.requires_grad:
@@ -1273,6 +1324,8 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             trainable_params.append(parameters)
             if use_depth_group and name.startswith('depth_head'):
                 depth_params.append(parameters)
+            elif use_occ_group and any(name.startswith(prefix) for prefix in occ_param_prefixes):
+                occ_params.append(parameters)
             else:
                 main_params.append(parameters)
             print(f'Training parameter: {name}')
@@ -1281,9 +1334,11 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             num_devices = self.trainer.num_devices
             scale_devices = max(1, log2(num_devices))
             base_lr = self.learning_rate * scale_devices
+            occ_lr = getattr(self, 'occ_lr', self.learning_rate) * scale_devices
             depth_lr = getattr(self, 'depth_head_lr', self.learning_rate) * scale_devices
         else:
             base_lr = self.learning_rate
+            occ_lr = getattr(self, 'occ_lr', self.learning_rate)
             depth_lr = getattr(self, 'depth_head_lr', self.learning_rate)
 
         if not trainable_params:
@@ -1291,21 +1346,43 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             trainable_params = [torch.nn.Parameter(torch.zeros(1))]
             main_params = trainable_params
 
-        if use_depth_group and depth_params and main_params:
-            param_groups = [
-                {'params': main_params, 'lr': base_lr, 'weight_decay': self.weight_decay, 'name': 'main'},
-                {'params': depth_params, 'lr': depth_lr, 'weight_decay': getattr(self, 'depth_head_weight_decay', self.weight_decay), 'name': 'depth'},
-            ]
-            print(f"\nOptimizer configuration (param groups):")
-            print(f"  Main params: {len(main_params)}")
-            print(f"  Depth-head params: {len(depth_params)}")
-            print(f"  Main lr: {base_lr}")
-            print(f"  Depth-head lr: {depth_lr}")
-        else:
+        param_groups = []
+        max_lrs = []
+        if main_params:
+            param_groups.append({
+                'params': main_params,
+                'lr': base_lr,
+                'weight_decay': self.weight_decay,
+                'name': 'main',
+            })
+            max_lrs.append(base_lr)
+        if use_occ_group and occ_params:
+            param_groups.append({
+                'params': occ_params,
+                'lr': occ_lr,
+                'weight_decay': getattr(self, 'occ_weight_decay', self.weight_decay),
+                'name': 'occ',
+            })
+            max_lrs.append(occ_lr)
+        if use_depth_group and depth_params:
+            param_groups.append({
+                'params': depth_params,
+                'lr': depth_lr,
+                'weight_decay': getattr(self, 'depth_head_weight_decay', self.weight_decay),
+                'name': 'depth',
+            })
+            max_lrs.append(depth_lr)
+
+        if not param_groups:
             param_groups = [{'params': trainable_params, 'lr': base_lr, 'weight_decay': self.weight_decay, 'name': 'main'}]
-            print(f"\nOptimizer configuration (single group):")
-            print(f"  Total trainable parameters: {len(trainable_params)}")
-            print(f"  Learning rate: {base_lr}")
+            max_lrs = [base_lr]
+
+        print(f"\nOptimizer configuration (param groups):")
+        print(f"  Main params: {len(main_params)} lr={base_lr}")
+        if use_occ_group:
+            print(f"  OCC params: {len(occ_params)} lr={occ_lr}")
+        if use_depth_group:
+            print(f"  Depth-head params: {len(depth_params)} lr={depth_lr}")
 
         optimizer = optim.AdamW(param_groups, betas=(0.9, 0.98), eps=1e-7)
 
@@ -1315,12 +1392,24 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         if total_steps is None or not np.isfinite(total_steps):
             total_steps = 1
         train_batches = max(1, int(total_steps))
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-                    optimizer,
-                    T_0=max(1, int(self.lr_restart_epoch * train_batches)),
-                    T_mult=self.lr_restart_mult,
-                    eta_min=base_lr * self.lr_min_factor * 0.1
-                )
+        scheduler_type = getattr(self, 'lr_scheduler', 'cosine_warm_restarts')
+        if scheduler_type == 'onecycle':
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=max_lrs,
+                total_steps=train_batches,
+                pct_start=getattr(self, 'onecycle_pct_start', 0.05),
+                anneal_strategy='cos',
+                div_factor=getattr(self, 'onecycle_div_factor', 25.0),
+                final_div_factor=getattr(self, 'onecycle_final_div_factor', 10000.0),
+            )
+        else:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                        optimizer,
+                        T_0=max(1, int(self.lr_restart_epoch * train_batches)),
+                        T_mult=self.lr_restart_mult,
+                        eta_min=base_lr * self.lr_min_factor * 0.1
+                    )
         return {
             'optimizer': optimizer,
             'lr_scheduler': {
@@ -1583,9 +1672,15 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                     image_list.dtype,
                 )
             if depth_override is not None:
-                model_out = self.model(image_list, inputs['K'], inputs['c2e_extr'], depth_maps_override=depth_override)
+                model_out = self.model(
+                    image_list,
+                    inputs['K'],
+                    inputs['c2e_extr'],
+                    depth_maps_override=depth_override,
+                    occ_inputs=inputs,
+                )
             else:
-                model_out = self.model(image_list, inputs['K'], inputs['c2e_extr'])
+                model_out = self.model(image_list, inputs['K'], inputs['c2e_extr'], occ_inputs=inputs)
         else:
             model_out = self.model(image_list)
 
@@ -1597,9 +1692,13 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             sh_maps = model_out['sh_maps']
             forward_flow = model_out['forward_flow']
             offset_maps = model_out.get('offset_maps', None)
+            sparse_gaussians = model_out.get('sparse_gaussians', False)
+            voxel_meta = model_out.get('voxel_meta', None)
         else:
             depth_maps, rot_maps, scale_maps, opacity_maps, sh_maps, forward_flow = model_out
             offset_maps = None
+            sparse_gaussians = False
+            voxel_meta = None
         if self.enable_nan_checks:
             self._check_finite(depth_maps, "depth_maps")
             self._check_finite(rot_maps, "rot_maps")
@@ -1622,7 +1721,64 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         bf_e2c = torch.linalg.inv(bfc_c2e)
         bfc_xyz = depth2pc(bfc_depth_maps, bf_e2c, bfc_K)
 
-        gaussians_per_voxel = rot_maps.shape[-2] if rot_maps.dim() == 6 else 1
+        gaussians_per_voxel = rot_maps.shape[-2] if rot_maps.dim() in (3, 6) else 1
+
+        if sparse_gaussians:
+            if voxel_meta is None:
+                raise ValueError("Sparse voxel path requires voxel_meta in model outputs")
+
+            voxel_batch_idx = voxel_meta['batch_idx']
+            voxel_centers = voxel_meta['voxel_centers']
+            if offset_maps is None:
+                raise ValueError("Sparse voxel path requires offset_maps in model outputs")
+
+            outputs['pred_depths'] = rearrange(bfc_depth_maps, '(b c) h w -> b (c h w)', b=batch_size, c=frame_camrea)
+            outputs['pred_depth_maps'] = depth_maps.squeeze(-1)
+
+            if offset_maps.numel() == 0:
+                empty_xyz = [voxel_centers.new_zeros((0, 3)) for _ in range(batch_size)]
+                outputs['xyz'] = empty_xyz
+                outputs['rot_maps'] = [rot_maps.new_zeros((0, 4)) for _ in range(batch_size)]
+                outputs['scale_maps'] = [scale_maps.new_zeros((0, 3)) for _ in range(batch_size)]
+                outputs['opacity_maps'] = [opacity_maps.new_zeros((0, 1)) for _ in range(batch_size)]
+                outputs['sh_maps'] = [sh_maps.new_zeros((0, sh_maps.shape[-1], sh_maps.shape[-2])) for _ in range(batch_size)]
+                outputs['forward_flow'] = [voxel_centers.new_zeros((0, 3)) for _ in range(batch_size)]
+                outputs['xyz_transformed'] = outputs['xyz']
+                outputs['rot_maps_transformed'] = outputs['rot_maps']
+                outputs['sh_maps_transformed'] = outputs['sh_maps']
+                outputs['sparse_gaussians'] = True
+                outputs['inputs'] = inputs
+                return outputs
+
+            xyz_sparse = voxel_centers.unsqueeze(1) + offset_maps
+            sh_sparse = sh_maps.transpose(-1, -2).contiguous()
+            if self.enable_nan_checks:
+                self._check_finite(xyz_sparse, "xyz_sparse")
+                self._check_finite(sh_sparse, "sh_sparse")
+
+            outputs['xyz'] = []
+            outputs['rot_maps'] = []
+            outputs['scale_maps'] = []
+            outputs['opacity_maps'] = []
+            outputs['sh_maps'] = []
+            outputs['forward_flow'] = []
+
+            for b in range(batch_size):
+                batch_mask = voxel_batch_idx == b
+                outputs['xyz'].append(xyz_sparse[batch_mask].reshape(-1, 3))
+                outputs['rot_maps'].append(rot_maps[batch_mask].reshape(-1, 4))
+                outputs['scale_maps'].append(scale_maps[batch_mask].reshape(-1, 3))
+                outputs['opacity_maps'].append(opacity_maps[batch_mask].reshape(-1, 1))
+                outputs['sh_maps'].append(sh_sparse[batch_mask].reshape(-1, sh_sparse.shape[-2], sh_sparse.shape[-1]))
+                outputs['forward_flow'].append(xyz_sparse.new_zeros((outputs['xyz'][-1].shape[0], 3)))
+
+            outputs['xyz_transformed'] = outputs['xyz']
+            outputs['rot_maps_transformed'] = outputs['rot_maps']
+            outputs['sh_maps_transformed'] = outputs['sh_maps']
+            outputs['sparse_gaussians'] = True
+            outputs['inputs'] = inputs
+            return outputs
+
         if offset_maps is not None and offset_maps.dim() == 6:
             bfc_offset = rearrange(offset_maps, 'b c h w k d -> (b c) (h w) k d')
             bfc_xyz = bfc_xyz.unsqueeze(2) + bfc_offset
@@ -2148,10 +2304,14 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             else:
                 xyz = recontrast_data['xyz']
             flow = recontrast_data['forward_flow']
-            mid_point = xyz.shape[1] // 2
+            sparse_gaussians = isinstance(xyz, (list, tuple))
+            mid_point = None if sparse_gaussians else xyz.shape[1] // 2
 
-            xyz_t = xyz.clone()
-            if self.use_vehicle_flow:
+            if sparse_gaussians:
+                xyz_t = [x.clone() for x in xyz]
+            else:
+                xyz_t = xyz.clone()
+            if self.use_vehicle_flow and not sparse_gaussians:
                 context_span_delta = self.context_span / 12.0
                 delta_t_flow = (frame_id / self.context_span) * context_span_delta
                 xyz_t[:, :mid_point] += flow[:, :mid_point] * delta_t_flow
@@ -2187,12 +2347,29 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                     c2e_extr_0 = input_all['c2e_extr'][:, cam_id, ...]  # [batch, 4, 4]
                     e2c_extr = torch.linalg.inv(c2e_extr_0)
 
-                projected_depth = pc2depth(
-                    xyz, e2c_extr, K,
-                    self.render_height, self.render_width
-                )
-
-                projected_depth = projected_depth.unsqueeze(1)
+                if sparse_gaussians:
+                    projected_depth_list = []
+                    for batch_id in range(bs):
+                        if xyz[batch_id].shape[0] == 0:
+                            projected_depth_list.append(
+                                K.new_zeros((self.render_height, self.render_width))
+                            )
+                            continue
+                        projected_depth_list.append(
+                            pc2depth(
+                                xyz[batch_id].unsqueeze(0),
+                                e2c_extr[batch_id:batch_id + 1],
+                                K[batch_id:batch_id + 1],
+                                self.render_height,
+                                self.render_width,
+                            )[0]
+                        )
+                    projected_depth = torch.stack(projected_depth_list, dim=0).unsqueeze(1)
+                else:
+                    projected_depth = pc2depth(
+                        xyz, e2c_extr, K,
+                        self.render_height, self.render_width
+                    ).unsqueeze(1)
                 if self.enable_nan_checks:
                     self._check_finite(projected_depth, f"projected_depths[{frame_id},{cam_id}]")
                 projected_depths[('projected_depths', frame_id, cam_id)] = projected_depth
@@ -2219,7 +2396,7 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                 # Frame 0 default path assumes per-camera contiguous point ordering.
                 # AE-reconstructed Gaussians are scene-global, so use all points per camera.
                 use_ae_global_points = recontrast_data.get('ae_global_points', False)
-                if frame_id == 0 and not use_ae_global_points:
+                if frame_id == 0 and not use_ae_global_points and not sparse_gaussians:
                     # Calculate points per camera (Gaussians are organized sequentially by camera)
                     points_per_cam = mid_point // self.num_cams
 
@@ -2307,28 +2484,34 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                     e2c_extr_i = torch.stack(e2c_extr_i, dim=0)
                     K_i = torch.stack(K_i, dim=0)
 
-                    render_colors_i, render_alphas_i, meta_i = rasterization(
-                        xyz_i,  # [N, 3]
-                        rot_i,  # [N, 4]
-                        scale_i,  # [N, 3]
-                        opacity_i.squeeze(-1),  # [N]
-                        sh_i,  # [N, K, 3]
-                        e2c_extr_i,  # [6, 4, 4]
-                        K_i,  # [6, 3, 3]
-                        self.render_width,
-                        self.render_height,
-                        sh_degree=self.sh_degree,
-                        render_mode="RGB",
-                        # sparse_grad=True,
-                        # this is to speedup large-scale rendering by skipping far-away Gaussians.
-                        # radius_clip=3,
-                    )
-                    # render_rgb_i, render_depth_i = render_colors_i[...,:3], render_colors_i[...,3]
-                    render_rgb_i = render_colors_i[...,:3].permute(0,3,1,2)
-                    if render_alphas_i.dim() == 3:
-                        render_alphas_i = render_alphas_i.unsqueeze(-1)
-                    render_alpha_i = render_alphas_i.permute(0, 3, 1, 2)  # [num_cams, 1, H, W]
-                    del xyz_i, rot_i, scale_i, opacity_i, sh_i, e2c_extr_i, K_i, render_colors_i, render_alphas_i, meta_i
+                    if xyz_i.shape[0] == 0:
+                        render_rgb_i = xyz_i.new_zeros((self.num_cams, 3, self.render_height, self.render_width))
+                        render_alpha_i = xyz_i.new_zeros((self.num_cams, 1, self.render_height, self.render_width))
+                    else:
+                        render_colors_i, render_alphas_i, meta_i = rasterization(
+                            xyz_i,  # [N, 3]
+                            rot_i,  # [N, 4]
+                            scale_i,  # [N, 3]
+                            opacity_i.squeeze(-1),  # [N]
+                            sh_i,  # [N, K, 3]
+                            e2c_extr_i,  # [6, 4, 4]
+                            K_i,  # [6, 3, 3]
+                            self.render_width,
+                            self.render_height,
+                            sh_degree=self.sh_degree,
+                            render_mode="RGB",
+                            # sparse_grad=True,
+                            # this is to speedup large-scale rendering by skipping far-away Gaussians.
+                            # radius_clip=3,
+                        )
+                        # render_rgb_i, render_depth_i = render_colors_i[...,:3], render_colors_i[...,3]
+                        render_rgb_i = render_colors_i[...,:3].permute(0,3,1,2)
+                        if render_alphas_i.dim() == 3:
+                            render_alphas_i = render_alphas_i.unsqueeze(-1)
+                        render_alpha_i = render_alphas_i.permute(0, 3, 1, 2)  # [num_cams, 1, H, W]
+                        del render_colors_i, render_alphas_i, meta_i
+
+                    del xyz_i, rot_i, scale_i, opacity_i, sh_i, e2c_extr_i, K_i
 
                     for cam_id in range(self.num_cams):
                         if ('gaussian_color', frame_id, cam_id) not in outputs:
@@ -2797,12 +2980,32 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         return gt_depth.to(device=device, dtype=dtype)
 
     def compute_norm_loss(self, batch_data):
+        scale_maps = batch_data['scale_maps']
+        opacity_maps = batch_data['opacity_maps']
 
-        scale_loss = self.lambda_scale * torch.mean(torch.norm(batch_data['scale_maps'], dim=-1))
+        if isinstance(scale_maps, (list, tuple)):
+            scale_terms = [torch.norm(scale_item, dim=-1) for scale_item in scale_maps if scale_item.numel() > 0]
+            if scale_terms:
+                scale_loss = self.lambda_scale * torch.mean(torch.cat(scale_terms, dim=0))
+            else:
+                ref_tensor = opacity_maps[0] if isinstance(opacity_maps, (list, tuple)) and len(opacity_maps) > 0 else None
+                device = ref_tensor.device if torch.is_tensor(ref_tensor) else self.device
+                dtype = ref_tensor.dtype if torch.is_tensor(ref_tensor) else torch.float32
+                scale_loss = torch.zeros((), device=device, dtype=dtype)
+        else:
+            scale_loss = self.lambda_scale * torch.mean(torch.norm(scale_maps, dim=-1))
 
-
-        opacity_loss = self.lambda_opacity * torch.mean(torch.abs(batch_data['opacity_maps']))
-
+        if isinstance(opacity_maps, (list, tuple)):
+            opacity_terms = [torch.abs(opacity_item) for opacity_item in opacity_maps if opacity_item.numel() > 0]
+            if opacity_terms:
+                opacity_loss = self.lambda_opacity * torch.mean(torch.cat(opacity_terms, dim=0))
+            else:
+                ref_tensor = scale_maps[0] if isinstance(scale_maps, (list, tuple)) and len(scale_maps) > 0 else None
+                device = ref_tensor.device if torch.is_tensor(ref_tensor) else self.device
+                dtype = ref_tensor.dtype if torch.is_tensor(ref_tensor) else torch.float32
+                opacity_loss = torch.zeros((), device=device, dtype=dtype)
+        else:
+            opacity_loss = self.lambda_opacity * torch.mean(torch.abs(opacity_maps))
 
         total_reg_loss = scale_loss + opacity_loss
 
@@ -2879,6 +3082,45 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         xyz = batch_recontrast_data.get('xyz', None)
         if xyz is None:
             return torch.tensor(0.0, device=self.device)
+
+        if isinstance(xyz, (list, tuple)):
+            total_loss = torch.tensor(0.0, device=self.device)
+            total_weight = torch.tensor(0.0, device=self.device)
+            for batch_id, xyz_batch in enumerate(xyz):
+                if xyz_batch.numel() == 0:
+                    continue
+                grid_x = 2.0 * (xyz_batch[:, 0] - getattr(self, 'voxel_x_range', (-40.0, 40.0))[0]) / (
+                    getattr(self, 'voxel_x_range', (-40.0, 40.0))[1] - getattr(self, 'voxel_x_range', (-40.0, 40.0))[0] + 1e-6
+                ) - 1.0
+                grid_y = 2.0 * (xyz_batch[:, 1] - getattr(self, 'voxel_y_range', (-40.0, 40.0))[0]) / (
+                    getattr(self, 'voxel_y_range', (-40.0, 40.0))[1] - getattr(self, 'voxel_y_range', (-40.0, 40.0))[0] + 1e-6
+                ) - 1.0
+                grid_z = 2.0 * (xyz_batch[:, 2] - getattr(self, 'voxel_z_range', (-1.0, 5.4))[0]) / (
+                    getattr(self, 'voxel_z_range', (-1.0, 5.4))[1] - getattr(self, 'voxel_z_range', (-1.0, 5.4))[0] + 1e-6
+                ) - 1.0
+                grid = torch.stack([grid_x, grid_y, grid_z], dim=-1).view(1, xyz_batch.shape[0], 1, 1, 3)
+
+                occ_vol = surface_occ[batch_id:batch_id + 1].permute(0, 3, 2, 1).unsqueeze(1)
+                vis_vol = visible_mask[batch_id:batch_id + 1].permute(0, 3, 2, 1).unsqueeze(1)
+                occ_samples = torch.nn.functional.grid_sample(
+                    occ_vol, grid, mode='bilinear', padding_mode='zeros', align_corners=True
+                ).view(-1)
+                vis_samples = torch.nn.functional.grid_sample(
+                    vis_vol, grid, mode='bilinear', padding_mode='zeros', align_corners=True
+                ).view(-1)
+                vis_weights = vis_samples.clamp(0.0, 1.0)
+                if not (vis_weights > 1e-3).any():
+                    continue
+                geom_error = (1.0 - occ_samples).clamp(0.0, 1.0)
+                total_loss = total_loss + (geom_error * vis_weights).sum()
+                total_weight = total_weight + vis_weights.sum()
+
+            if total_weight.item() == 0:
+                return torch.tensor(0.0, device=self.device)
+            loss = total_loss / (total_weight + 1e-6)
+            if self.enable_nan_checks:
+                self._check_finite(loss, "occ_geometry_loss")
+            return self.lambda_occ * loss
 
         b, n, _ = xyz.shape
         x0, x1 = getattr(self, 'voxel_x_range', (-40.0, 40.0))

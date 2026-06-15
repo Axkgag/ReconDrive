@@ -1,7 +1,10 @@
+save_dir: './work_dirs/recondrive_stage1_voxel_training'
 seed: 42
+train_epoch: 30
+devices: [0,1,2,3,4,5,6,7]
 
+# Occ 监督统一开关（定义锚点，只需在此处修改）
 enable_occ: &enable_occ false  # 设为 true 启用 Occ 监督功能
-batch_size: &batch_size 2
 
 model_cfg:
   use_stage1: true
@@ -14,7 +17,7 @@ model_cfg:
   embed_dim: 1024
   auto_scale_lr: True
   enable_nan_checks: true
-  learning_rate: 0.00001
+  learning_rate: 0.000015
   use_separate_depth_optimizer: true  # true: depth_head 使用独立参数组；false: 与其他参数共用一个参数组
   depth_head_lr: 0.000003             # depth_head 专用学习率，仅在 use_separate_depth_optimizer=true 时生效
   depth_head_weight_decay: 0.01       # depth_head 专用 weight decay
@@ -47,14 +50,13 @@ model_cfg:
   save_image_duration: 100
   save_val_visualizations: true
   val_vis_interval: 200
-  val_vis_max_per_epoch: 2
-  train_vis_interval: 200
-  train_vis_first_batch_per_epoch: true
+  val_vis_max_per_epoch: 4
+  train_vis_interval: 50
 
   # Loss weights (Gaussian + Norm)
   lambda_gaussian: 2
-  lambda_scale: 0.01
-  lambda_opacity: 0.01
+  lambda_scale: 0.0005 
+  lambda_opacity: 0.001
   lambda_edge: 0.01
   lambda_depth: 0.01
   enable_depth_supervision: true
@@ -70,20 +72,6 @@ model_cfg:
   sam2_checkpoint: 'checkpoints/sam2.1_hiera_small.pt'
   sam2_model_cfg: 'configs/sam2.1/sam2.1_hiera_s.yaml'
   sam2_dir: null
-
-  recondrive_ckpt: 'work_dirs/recondrive_stage1_gtvoxel_training_densedepth/ckpt/epoch_epoch=75.ckpt'
-  batch_size: *batch_size
-
-vae_cfg:
-  base_channel: 64
-  latent_channels: 64
-  expansion: 32
-  ch_mult: [1, 2, 4, 8]
-  num_res_blocks: 2
-  attn_resolutions: []
-  dropout: 0.0
-  kl_weight: 0.00001
-  empty_weight: 0.05
 
 data_cfg:
   dataset_type: '3d'
@@ -108,15 +96,8 @@ data_cfg:
   enable_occ_supervision: *enable_occ  # 引用全局开关，与 model_cfg 保持同步
   filter_missing_occ: *enable_occ  # 设为 true 时跳过没有 Occ 数据的样本
 
-  batch_size: *batch_size
+  batch_size: 2
   data_shuffle: True
   drop_last: False
   num_workers: 4
-
-train_cfg:
-  max_epochs: 50
-  lr: 1.0e-4
-  weight_decay: 0.01
-  log_every_n_steps: 20
-  save_every_epochs: 1
-  vis_interval: 200
+  num_epochs: 10

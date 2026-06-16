@@ -47,7 +47,7 @@ echo ">>>安装 diff-gaussian-rasterization modified"
 pip install "git+https://gh-proxy.com/https://github.com/dcharatan/diff-gaussian-rasterization-modified"
 
 echo "=== Running OccWM setup_env.sh ==="
-cd /data_map/guoxiyue/OccWM && bash setup_env.sh
+bash scripts/setup_base_env.sh
 cd /data_map/guoxiyue/ReconDrive
 
 echo "=== Pinning huggingface-hub for transformers compatibility ==="
@@ -61,7 +61,7 @@ print(f"transformers: {transformers.__version__}")
 PY
 
 mkdir -p /root/.cache/torch/hub/checkpoints
-ln -sf /data_map/guoxiyue/ReconDrive/checkpoints/vgg16-397923af.pth /root/.cache/torch/hub/checkpoints/vgg16-397923af.pth
+ln -sf checkpoints/vgg16-397923af.pth /root/.cache/torch/hub/checkpoints/vgg16-397923af.pth
 
 echo ""
 echo "=== All dependencies installed successfully ==="

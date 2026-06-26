@@ -6,6 +6,7 @@
 
 import json
 import os
+import tempfile
 
 import numpy as np
 import PIL.Image as pil
@@ -82,6 +83,7 @@ class NuScenesdataset4D(Dataset):
         self.mask_loader = mask_loader_scene
         self.enable_occ_supervision = kwargs.get('enable_occ_supervision', False)
         self.filter_missing_occ = kwargs.get('filter_missing_occ', False)
+        self.filter_missing_depth = kwargs.get('filter_missing_depth', False)
         self.occ_data_path = kwargs.get('occ_data_path', None)
         self.occ_mask_dir = kwargs.get('occ_mask_dir', None)
 
@@ -160,7 +162,7 @@ class NuScenesdataset4D(Dataset):
 
     def _build_sample_index_cache_meta(self):
         return {
-            'cache_version': 1,
+            'cache_version': 2,
             'dataset_class': self.__class__.__name__,
             'stage': getattr(self, 'stage', None),
             'version': getattr(self, 'version', None),
@@ -169,6 +171,7 @@ class NuScenesdataset4D(Dataset):
             'depth_type': getattr(self, 'depth_type', None),
             'depth_root': os.path.abspath(self.depth_root) if self.depth_root else None,
             'with_depth': getattr(self, 'with_depth', False),
+            'filter_missing_depth': getattr(self, 'filter_missing_depth', False),
             'enable_occ_supervision': getattr(self, 'enable_occ_supervision', False),
             'filter_missing_occ': getattr(self, 'filter_missing_occ', False),
             'occ_data_path': os.path.abspath(self.occ_data_path) if getattr(self, 'occ_data_path', None) else None,
@@ -185,8 +188,11 @@ class NuScenesdataset4D(Dataset):
     def _load_sample_index_cache(self):
         if not self._sample_index_cache_path or not os.path.exists(self._sample_index_cache_path):
             return None
-        with open(self._sample_index_cache_path, 'r', encoding='utf-8') as f:
-            payload = json.load(f)
+        try:
+            with open(self._sample_index_cache_path, 'r', encoding='utf-8') as f:
+                payload = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
         if payload.get('meta') != self._sample_index_cache_meta:
             return None
         return payload
@@ -194,10 +200,20 @@ class NuScenesdataset4D(Dataset):
     def _save_sample_index_cache(self, payload):
         if not self._sample_index_cache_path:
             return
-        tmp_path = self._sample_index_cache_path + '.tmp'
-        with open(tmp_path, 'w', encoding='utf-8') as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, self._sample_index_cache_path)
+        cache_dir = os.path.dirname(self._sample_index_cache_path) or '.'
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=os.path.basename(self._sample_index_cache_path) + '.',
+            suffix='.tmp',
+            dir=cache_dir,
+            text=True,
+        )
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self._sample_index_cache_path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
     def _sample_image_path(self, cam_sample):
         return os.path.join(self.path, cam_sample['filename'])
@@ -215,7 +231,17 @@ class NuScenesdataset4D(Dataset):
         return depth_file_npy
 
     def _needs_depth_validation(self):
-        return self.with_depth and self.depth_root is not None
+        return self.with_depth and self.filter_missing_depth and self.depth_root is not None
+
+    def _maybe_load_depth(self, sample, sensor, cam_sample):
+        if not self.with_depth:
+            return None
+        try:
+            return self.generate_depth_map(sample, sensor, cam_sample)
+        except FileNotFoundError:
+            if self.filter_missing_depth:
+                raise
+            return None
 
     def _sample_has_occ_data(self, sample_token):
         return True
@@ -805,9 +831,9 @@ class NuScenesdataset4D(Dataset):
             }
 
             if self.with_depth:
-                data.update({
-                    'gt_depth': self.generate_depth_map(sample_nusc, cam, cam_sample)
-                })
+                gt_depth = self._maybe_load_depth(sample_nusc, cam, cam_sample)
+                if gt_depth is not None:
+                    data.update({'gt_depth': gt_depth})
             if self.with_pose:
                 data.update({
                     'extrinsics': self.get_current('extrinsics', cam_sample)
@@ -904,9 +930,9 @@ class NuScenesdataset4D(Dataset):
 
             # if depth is returned
             if self.with_depth:
-                data.update({
-                    'gt_depth': self.generate_depth_map(sample_nusc, cam, cam_sample)
-                })
+                gt_depth = self._maybe_load_depth(sample_nusc, cam, cam_sample)
+                if gt_depth is not None:
+                    data.update({'gt_depth': gt_depth})
             # if pose is returned
             if self.with_pose:
                 data.update({

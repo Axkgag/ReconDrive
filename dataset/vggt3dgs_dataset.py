@@ -41,11 +41,59 @@ class NuScenesdataset3D(NuScenesdataset4D):
 
         self.rebuild_sample_index(announce=True)
 
+    def _surroundocc_samples_dir(self):
+        nested = os.path.join(self.occ_base_path, 'nuscenes_extra', 'nuscenes_occ', 'samples')
+        if os.path.isdir(nested):
+            return nested
+        return self.occ_base_path
+
+    def _occ_file_for_sample(self, sample_token):
+        sample = self.dataset.get('sample', sample_token)
+        lidar_sample = self.dataset.get('sample_data', sample['data']['LIDAR_TOP'])
+        lidar_name = os.path.basename(lidar_sample['filename'])
+        return os.path.join(self._surroundocc_samples_dir(), lidar_name + '.npy')
+
     def _sample_has_occ_data(self, sample_token):
         if not self.enable_occ_supervision or not self.filter_missing_occ:
             return True
-        occ_file = os.path.join(self.occ_base_path, sample_token, 'labels.npz')
-        return os.path.exists(occ_file)
+        return os.path.exists(self._occ_file_for_sample(sample_token))
+
+    def _load_occ_data(self, occ_file):
+        sparse_occ = np.load(occ_file, allow_pickle=False)
+        if sparse_occ.ndim != 2 or sparse_occ.shape[1] < 4:
+            raise ValueError(f"SurroundOcc 文件格式错误: {occ_file}, shape={sparse_occ.shape}")
+
+        coords = sparse_occ[:, :3].astype(np.int64)
+        labels = sparse_occ[:, 3].astype(np.uint8)
+        valid = (
+            (coords[:, 0] >= 0) & (coords[:, 0] < 200) &
+            (coords[:, 1] >= 0) & (coords[:, 1] < 200) &
+            (coords[:, 2] >= 0) & (coords[:, 2] < 16)
+        )
+        coords = coords[valid]
+        labels = labels[valid]
+
+        occ_semantics = np.full((200, 200, 16), 17, dtype=np.uint8)
+        occ_semantics[coords[:, 0], coords[:, 1], coords[:, 2]] = labels
+        occ_visible_mask = np.zeros((200, 200, 16), dtype=np.uint8)
+        occ_visible_mask[coords[:, 0], coords[:, 1], coords[:, 2]] = 1
+        occ_surface = (occ_semantics != 17) & (occ_visible_mask > 0)
+        return {
+            'occ_semantics': occ_semantics,
+            'occ_mask_camera': None,
+            'occ_mask_lidar': occ_visible_mask,
+            'occ_surface': occ_surface.astype(np.uint8),
+            'occ_visible_mask': occ_visible_mask,
+        }
+
+    def _empty_occ_data(self):
+        return {
+            'occ_semantics': None,
+            'occ_mask_camera': None,
+            'occ_mask_lidar': None,
+            'occ_surface': None,
+            'occ_visible_mask': None,
+        }
 
     def __getitem__(self, idx: int, context_frame_idx: int = -1, return_all: bool = False) -> Dict[str, Any]:
         actual_idx = idx
@@ -106,41 +154,15 @@ class NuScenesdataset3D(NuScenesdataset4D):
 
         # 新增：加载 Occ 数据
         if self.enable_occ_supervision:
-            occ_file = os.path.join(self.occ_base_path, frame_idx, 'labels.npz')
+            occ_file = self._occ_file_for_sample(frame_idx)
             if os.path.exists(occ_file):
                 try:
-                    occ_data = np.load(occ_file)
-                    occ_semantics = occ_data['semantics']
-                    occ_mask_camera = occ_data.get('mask_camera', None)
-                    occ_mask_lidar = occ_data.get('mask_lidar', None)
-                    visible_mask = occ_mask_lidar if occ_mask_lidar is not None else occ_mask_camera
-                    surface_occ = None
-                    if visible_mask is not None:
-                        surface_occ = (occ_semantics != 17) & (visible_mask > 0)
-                    data.update({
-                        'occ_semantics': occ_semantics,  # [200,200,16] uint8
-                        'occ_mask_camera': occ_mask_camera,
-                        'occ_mask_lidar': occ_mask_lidar,
-                        'occ_surface': surface_occ.astype(np.uint8) if surface_occ is not None else None,
-                        'occ_visible_mask': visible_mask,
-                    })
+                    data.update(self._load_occ_data(occ_file))
                 except Exception as e:
                     print(f"警告: 加载 Occ 数据失败 {occ_file}: {e}")
-                    data.update({
-                        'occ_semantics': None,
-                        'occ_mask_camera': None,
-                        'occ_mask_lidar': None,
-                        'occ_surface': None,
-                        'occ_visible_mask': None,
-                    })
+                    data.update(self._empty_occ_data())
             else:
                 # 如果文件不存在，设置为 None
-                data.update({
-                    'occ_semantics': None,
-                    'occ_mask_camera': None,
-                    'occ_mask_lidar': None,
-                    'occ_surface': None,
-                    'occ_visible_mask': None,
-                })
+                data.update(self._empty_occ_data())
 
         return data

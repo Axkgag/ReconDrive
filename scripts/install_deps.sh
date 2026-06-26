@@ -44,11 +44,12 @@ echo "=== Installing pytorch3d (built from source, ~10-30 min) ==="
 pip install "git+https://gitcode.com/gh_mirrors/py/pytorch3d.git" ${PIP_MIRROR}
 
 echo ">>>安装 diff-gaussian-rasterization modified"
-pip install "git+https://gh-proxy.com/https://github.com/dcharatan/diff-gaussian-rasterization-modified"
+# pip install "git+https://gh-proxy.com/https://github.com/dcharatan/diff-gaussian-rasterization-modified"
+cd /home/jovyan/task-data/diff-gaussian-rasterization-modified
+pip install -e . ${PIP_MIRROR}
 
 echo "=== Running OccWM setup_env.sh ==="
 bash scripts/setup_base_env.sh
-cd /data_map/guoxiyue/ReconDrive
 
 echo "=== Pinning huggingface-hub for transformers compatibility ==="
 pip install "huggingface-hub>=0.23.2,<1.0" ${PIP_MIRROR}
@@ -60,8 +61,8 @@ print(f"huggingface-hub: {huggingface_hub.__version__}")
 print(f"transformers: {transformers.__version__}")
 PY
 
-mkdir -p /root/.cache/torch/hub/checkpoints
-ln -sf checkpoints/vgg16-397923af.pth /root/.cache/torch/hub/checkpoints/vgg16-397923af.pth
+mkdir -p ~/.cache/torch/hub/checkpoints
+cp checkpoints/vgg16-397923af.pth ~/.cache/torch/hub/checkpoints/vgg16-397923af.pth
 
 echo ""
 echo "=== All dependencies installed successfully ==="

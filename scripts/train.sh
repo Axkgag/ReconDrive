@@ -11,6 +11,33 @@ EXTRA_ARGS=""
 WILL_RESUME=false
 IS_STAGE1=false
 
+if [[ -n "${RECONDRIVE_CUDA_ARCH_LIST:-}" ]]; then
+    TORCH_CUDA_ARCH_LIST="${RECONDRIVE_CUDA_ARCH_LIST}"
+else
+    TORCH_CUDA_ARCH_LIST="$(python - <<'PY'
+import torch
+
+if not torch.cuda.is_available():
+    raise SystemExit("CUDA is required to detect TORCH_CUDA_ARCH_LIST")
+
+archs = {
+    f"{major}.{minor}"
+    for index in range(torch.cuda.device_count())
+    for major, minor in [torch.cuda.get_device_capability(index)]
+}
+print(";".join(sorted(archs)))
+PY
+)"
+fi
+export TORCH_CUDA_ARCH_LIST
+
+if [[ -z "${TORCH_CUDA_ARCH_LIST}" ]]; then
+    echo "Failed to determine TORCH_CUDA_ARCH_LIST" >&2
+    exit 1
+fi
+
+echo "Using TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}"
+
 # Auto-detect AE mode
 if [[ "${USE_AE:-0}" == "1" ]] || [[ "$CONFIG_PATH" == *"recondrive_ae.yaml" ]]; then
     EXTRA_ARGS="--use_ae"
@@ -76,6 +103,21 @@ Ks = torch.tensor([[[300.,0,128],[0,300,128],[0,0,1]]], device='cuda')
 rasterization(means, quats, scales, opacities, colors, viewmats, Ks, 256, 256)
 print('gsplat JIT cache ready')
 " || { echo 'gsplat warmup failed'; exit 1; }
+
+echo "=== Warming up LPIPS VGG16 weight cache (single process) ==="
+python - <<'PY'
+import os
+import torch
+from lpips import LPIPS
+
+LPIPS(net="vgg", pretrained=True, verbose=False)
+checkpoint_path = os.path.join(torch.hub.get_dir(), "checkpoints", "vgg16-397923af.pth")
+if not os.path.exists(checkpoint_path):
+    raise FileNotFoundError(f"VGG16 checkpoint was not cached at: {checkpoint_path}")
+print(f"LPIPS VGG16 cache ready: {checkpoint_path}")
+PY
+
+echo "TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}"
 
 python -m scripts.trainer \
     --cfg_path=${CONFIG_PATH} \

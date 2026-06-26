@@ -207,6 +207,7 @@ class VGGT3DGS_SceneDataModule(pl.LightningDataModule):
             'enable_occ_supervision': getattr(self, 'enable_occ_supervision', False),
             'occ_data_path': getattr(self, 'occ_data_path', None),
             'filter_missing_occ': getattr(self, 'filter_missing_occ', False),
+            'filter_missing_depth': getattr(self, 'filter_missing_depth', False),
             'occ_mask_dir': occ_mask_dir,
         }
 

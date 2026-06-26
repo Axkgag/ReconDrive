@@ -40,8 +40,8 @@ pip install vtk==9.2.6 -i "${ALIYUN_PYPI}"
 echo ">>> 安装 pyqt5==5.15.10"
 pip install pyqt5==5.15.10 -i "${ALIYUN_PYPI}"
 
-echo ">>> 安装 mayavi==4.8.1"
-pip install mayavi==4.8.1 -i "${ALIYUN_PYPI}" --no-build-isolation
+# echo ">>> 安装 mayavi==4.8.1"
+# pip install mayavi==4.8.1 -i "${ALIYUN_PYPI}" --no-build-isolation
 
 echo ">>> 安装 lpips==0.1.4"
 pip install lpips==0.1.4 -i "${ALIYUN_PYPI}"
@@ -50,9 +50,9 @@ echo ">>> 安装 xvfb"
 apt-get update
 apt-get install -y xvfb
 
-echo ">>> 进入 occforecasting 并执行 setup.py develop"
-cd occforecasting
-python setup.py develop
-cd ..
+# echo ">>> 进入 occforecasting 并执行 setup.py develop"
+# cd occforecasting
+# python setup.py develop
+# cd ..
 
 echo ">>> 环境配置完成"

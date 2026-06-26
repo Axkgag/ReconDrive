@@ -22,6 +22,33 @@ if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
     export CUDA_VISIBLE_DEVICES
 fi
 
+if [[ -n "${RECONDRIVE_CUDA_ARCH_LIST:-}" ]]; then
+    TORCH_CUDA_ARCH_LIST="${RECONDRIVE_CUDA_ARCH_LIST}"
+else
+    TORCH_CUDA_ARCH_LIST="$(python - <<'PY'
+import torch
+
+if not torch.cuda.is_available():
+    raise SystemExit("CUDA is required to detect TORCH_CUDA_ARCH_LIST")
+
+archs = {
+    f"{major}.{minor}"
+    for index in range(torch.cuda.device_count())
+    for major, minor in [torch.cuda.get_device_capability(index)]
+}
+print(";".join(sorted(archs)))
+PY
+)"
+fi
+export TORCH_CUDA_ARCH_LIST
+
+if [[ -z "${TORCH_CUDA_ARCH_LIST}" ]]; then
+    echo "Failed to determine TORCH_CUDA_ARCH_LIST" >&2
+    exit 1
+fi
+
+echo "Using TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}"
+
 SCRIPT_ARGS=(--cfg_path "${CONFIG_PATH}")
 
 if [[ -n "${WORK_DIR}" ]]; then
@@ -69,8 +96,24 @@ torch.cuda.synchronize()
 print("gsplat JIT cache ready")
 PY
 
+# Warm up the LPIPS VGG16 weight cache before launching DDP.
+# Otherwise every rank may try to download the same torchvision weight file.
+echo "=== Warming up LPIPS VGG16 weight cache (single process) ==="
+python - <<'PY'
+import os
+import torch
+from lpips import LPIPS
+
+LPIPS(net="vgg", pretrained=True, verbose=False)
+checkpoint_path = os.path.join(torch.hub.get_dir(), "checkpoints", "vgg16-397923af.pth")
+if not os.path.exists(checkpoint_path):
+    raise FileNotFoundError(f"VGG16 checkpoint was not cached at: {checkpoint_path}")
+print(f"LPIPS VGG16 cache ready: {checkpoint_path}")
+PY
+
 echo "=== Training voxel VAE ==="
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+echo "TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}"
 echo "NUM_GPUS=${NUM_GPUS}"
 echo "CONFIG_PATH=${CONFIG_PATH}"
 

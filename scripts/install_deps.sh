@@ -61,7 +61,7 @@ print(f"transformers: {transformers.__version__}")
 PY
 
 mkdir -p /root/.cache/torch/hub/checkpoints
-ln -sf checkpoints/vgg16-397923af.pth /root/.cache/torch/hub/checkpoints/vgg16-397923af.pth
+cp checkpoints/vgg16-397923af.pth /root/.cache/torch/hub/checkpoints/vgg16-397923af.pth
 
 echo ""
 echo "=== All dependencies installed successfully ==="

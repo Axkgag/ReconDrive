@@ -50,9 +50,9 @@ echo ">>> 安装 xvfb"
 apt-get update
 apt-get install -y xvfb
 
-echo ">>> 进入 occforecasting 并执行 setup.py develop"
-cd occforecasting
-python setup.py develop
-cd ..
+# echo ">>> 进入 occforecasting 并执行 setup.py develop"
+# cd occforecasting
+# python setup.py develop
+# cd ..
 
 echo ">>> 环境配置完成"

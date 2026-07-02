@@ -1,0 +1,64 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "ReconDrive Stage1 OCC Debug",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "/usr/local/bin/python",
+      "module": "scripts.trainer",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "subProcess": true,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}",
+        "CUDA_VISIBLE_DEVICES": "0",
+        "TOKENIZERS_PARALLELISM": "false"
+      },
+      "args": [
+        "--cfg_path",
+        "${workspaceFolder}/configs/nuscenes/recondrive_stage1_voxel_occ.yaml",
+        "--train_4d",
+        "--devices",
+        "1",
+        "--use_stage1",
+        "--work_dir",
+        "${workspaceFolder}/work_dirs/vscode_stage1_occ_debug",
+        "--tensorboard_dir",
+        "${workspaceFolder}/work_dirs/vscode_stage1_occ_debug/tensorboard",
+        "--pretrained_ckpt",
+        "${workspaceFolder}/checkpoints/recondrive_stage1.ckpt"
+      ]
+    },
+    {
+      "name": "ReconDrive Stage1 OCC Resume Debug",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "/usr/local/bin/python",
+      "module": "scripts.trainer",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "subProcess": true,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}",
+        "CUDA_VISIBLE_DEVICES": "0",
+        "TOKENIZERS_PARALLELISM": "false"
+      },
+      "args": [
+        "--cfg_path",
+        "${workspaceFolder}/configs/nuscenes/recondrive_stage1_voxel_occ.yaml",
+        "--train_4d",
+        "--devices",
+        "1",
+        "--use_stage1",
+        "--work_dir",
+        "${workspaceFolder}/work_dirs/vscode_stage1_occ_debug",
+        "--tensorboard_dir",
+        "${workspaceFolder}/work_dirs/vscode_stage1_occ_debug/tensorboard",
+        "--resume"
+      ]
+    }
+  ]
+}
